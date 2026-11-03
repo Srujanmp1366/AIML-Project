@@ -19,6 +19,8 @@ class Job:
     hours_left: float
     deadline: pd.Timestamp
     deferrable: bool
+    has_started: bool = False
+    ran_last_hour: bool = False
 
 
 Decision = Callable[[pd.Timestamp, list[Job], np.ndarray, int | None], list[str]]
@@ -104,6 +106,57 @@ def forecast_greedy(
     must_run.sort(key=lambda job: (slack(job, now), indexed[id(job)]))
     wants.sort(key=lambda job: (slack(job, now), indexed[id(job)]))
     return _fitting(must_run + wants, free_gpus)
+
+
+def _block_cost(job: Job, forecast: np.ndarray, first_hour: int, resume_minutes: float) -> float:
+    """Predicted CI-weighted work for a contiguous execution block."""
+    remaining = job.hours_left
+    cost = 0.0
+    for offset in range(math.ceil(remaining)):
+        run_hours = min(1.0, remaining)
+        remaining -= run_hours
+        resume = resume_minutes / 60.0 if offset == 0 and job.has_started and (
+            first_hour > 0 or not job.ran_last_hour
+        ) else 0.0
+        cost += (run_hours + resume) * float(forecast[first_hour + offset])
+    return cost
+
+
+def make_guarded_greedy(error_margin_ci: float = 0.0, resume_minutes: float = 5.0) -> Decision:
+    """Prefer feasible continuous runs; require a clear forecast benefit to wait.
+
+    ``error_margin_ci`` is a per-hour forecast-error scale in gCO2/kWh,
+    estimated from validation data. It is a heuristic margin, not a guarantee.
+    """
+    if (not math.isfinite(error_margin_ci) or error_margin_ci < 0
+            or not math.isfinite(resume_minutes) or resume_minutes < 0):
+        raise ValueError("forecast error margin and resume minutes must be finite and nonnegative")
+
+    def decide(now: pd.Timestamp, waiting_jobs: list[Job], forecast: np.ndarray,
+               free_gpus: int | None) -> list[str]:
+        urgent: list[Job] = []
+        ready: list[Job] = []
+        for job in waiting_jobs:
+            if not job.deferrable:
+                urgent.append(job)
+                continue
+            remaining_slots = math.ceil(job.hours_left)
+            wait_hours = min(math.floor(slack(job, now)), len(forecast) - remaining_slots)
+            if wait_hours <= 0:
+                urgent.append(job)
+                continue
+            cost_now = _block_cost(job, forecast, 0, resume_minutes)
+            best_later = min(_block_cost(job, forecast, hour, resume_minutes)
+                             for hour in range(1, wait_hours + 1))
+            uncertainty = 2.0 * error_margin_ci * job.hours_left
+            if cost_now <= best_later + uncertainty:
+                ready.append(job)
+        order = {id(job): index for index, job in enumerate(waiting_jobs)}
+        urgent.sort(key=lambda job: (slack(job, now) if job.deferrable else float("-inf"), order[id(job)]))
+        ready.sort(key=lambda job: (slack(job, now), order[id(job)]))
+        return _fitting(urgent + ready, free_gpus)
+
+    return decide
 
 
 # The oracle differs only in which CI series the simulator supplies.
