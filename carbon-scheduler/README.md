@@ -1,0 +1,50 @@
+# Carbon aware scheduler
+
+This small Python codebase compares hourly scheduling policies for ML jobs against an Indian-grid carbon-intensity trace. It consumes job, actual-grid, and forecast CSV files; it does not train a forecaster or fit an MEF regression. No sample data is included.
+
+Requires Python 3.10+, pandas, numpy, and matplotlib. Install pytest to run the inline-fixture test suite.
+
+## Inputs
+
+Put these files in `data/`:
+
+- `jobs.csv`: `job_id`, `arrival`, `duration_hours`, `gpus`, `deferrable`
+- `grid_truth.csv`: `time`, `actual_ci`, `mef`
+- `forecasts_<model>.csv`: `issue_time`, `target_time`, `predicted_ci`
+
+Timestamps must identify UTC hours. Each forecast issue time needs exactly 24 target rows, from the first target hour through the following 23 hours. `actual_ci` and `predicted_ci` are in gCO₂/kWh; MEF uses the same units. Leave `mef` empty when marginal intensity is unavailable. In that case the simulator warns and reports marginal scores as missing.
+
+The simulator treats `deferrable` values `true`, `1`, and `yes` as true (case insensitive). GPU demand is rounded up to a whole GPU.
+
+## Run
+
+From this directory, use an environment with the dependencies above, then:
+
+```bash
+python run.py naive
+python run.py sweep --forecast data/forecasts_naive24.csv
+python run.py sweep --forecast data/forecasts_naive24.csv --figures
+pytest
+```
+
+`naive` writes `data/forecasts_naive24.csv`, using the actual CI from 24 hours before each target hour. `sweep` runs `run_now`, `threshold`, `forecast_greedy`, and `oracle` for `k = 6, 12, 24, 48` and capacities of 64, 32, 128, and unlimited GPUs. It writes `results/summary.csv` and one CSV per run under `results/per_job/`. `--figures` also writes `results/co2_saved_vs_k.png` and `results/capacity_savings.png`.
+
+The test period defaults to the hourly starts represented by the forecast file. The `run_sim` API also accepts an optional UTC `start` and exclusive `end` timestamp.
+
+## Model assumptions
+
+- Scheduling decisions happen at hour boundaries. A job joins the queue at the first hour boundary at or after its arrival; its deferrable deadline remains exact arrival plus `k` hours.
+- Inference jobs get capacity first in arrival order. Jobs that finish during an hour use GPUs only for their partial work time; those GPUs remain idle until the next hourly decision.
+- A resumed job adds five minutes of GPU energy use, with no added wall time. That overhead affects kWh and emissions, but not GPU utilisation.
+- Energy is `GPU count × 0.4 kW × 1.5 PUE × (run hours + resume overhead)`. The 0.4 kW figure is anchored to the NVIDIA A100 SXM maximum power specification; it is a modeling reference, not a measurement of a particular workload. The PUE of 1.5 is a rounded scenario value near Uptime Institute's reported 2026 industry average PUE of 1.52. See the [NVIDIA A100 datasheet](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet.pdf) and [Uptime Institute's 2026 PUE survey update](https://intelligence.uptimeinstitute.com/resource/growing-pue-advantage-larger-data-centers).
+- Average and marginal emissions are always scored with actual CI/MEF for the hour energy was used. Missing MEF disables marginal scoring. A trailing 30-day median for `threshold` uses actual CI strictly before the current hour.
+- `oracle` is the same greedy policy as `forecast_greedy`, with actual CI supplied as its 24-hour signal. It is a perfect-forecast comparison, not a globally optimal schedule.
+- GPU utilisation is busy GPU-hours divided by finite capacity times simulated hours. It is undefined (`NaN`) for unlimited capacity.
+
+## Limitations
+
+- The simulator needs complete hourly truth and a complete 24-hour forecast at each simulated decision time; it does not fill gaps or infer timezone semantics from local time.
+- There is no idle GPU power, CPU, memory, networking, checkpoint storage, startup cost, or grid-side response model.
+- Jobs cannot be backfilled after a mid-hour finish, and the fixed resume cost does not vary by model or checkpoint state.
+- Forecast uncertainty and MEF regression error are outside the simulator; the oracle uses a heuristic policy and is not a mathematical optimum.
+- Mean added delay is averaged over jobs that finish in the test period. Unfinished deferrable jobs count as deadline misses.
