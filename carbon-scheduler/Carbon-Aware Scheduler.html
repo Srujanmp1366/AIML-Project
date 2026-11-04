@@ -308,6 +308,12 @@ footer.page{margin-top:48px;padding-top:18px;border-top:1px solid var(--border);
         <div class="file-row"><input type="file" id="fcFiles" accept=".csv" multiple></div>
         <div class="model-tags" id="modelTags"></div>
       </div>
+      <div class="upload-card">
+        <h4>Python sweep summary <span class="status-pill off" id="summaryStatus">not loaded</span></h4>
+        <p class="hint">Validate the scheduler output CSV with policy, k, GPU capacity, energy, emissions, deadline, delay, and utilization metrics.</p>
+        <div class="file-row"><input type="file" id="summaryFile" accept=".csv"></div>
+        <p class="hint" id="summaryStatusMessage" role="status" aria-live="polite">Expected output: <span class="mono">results/summary.csv</span>. This validates and stores the rows; it does not yet drive the dashboard charts.</p>
+      </div>
       <div class="upload-note" id="uploadNote">Upload <strong>grid_truth.csv</strong> to activate the timeline. A forecast file is optional &mdash; without one, the scheduler falls back to a same-hour-yesterday naive forecast.</div>
     </div>
     <div class="ctrl">
@@ -488,7 +494,7 @@ let rng = mulberry32(seed);
 function parseCSV(text){
   const lines = text.replace(/\r/g,"").split("\n").filter(l=>l.trim().length>0);
   if (lines.length<2) return {header:[], rows:[]};
-  const header = lines[0].split(",").map(s=>s.trim());
+  const header = lines[0].replace(/^\uFEFF/,"").split(",").map(s=>s.trim());
   const rows = lines.slice(1).map(line=>{
     const cells = line.split(",").map(s=>s.trim());
     const obj = {};
@@ -552,8 +558,90 @@ let upload = {
   truthLoaded:false, truthRows:[], h0:0, horizon:0,
   actual:[], mef:[],
   models:{}, // name -> {rows:[{issue,target,pred}], byIssue: Map(issueH -> Map(targetH->pred))}
-  driving:null
+  driving:null,
+  summaryRows:[],
+  summaryFileName:null
 };
+
+const SUMMARY_REQUIRED_COLUMNS = [
+  "policy", "k", "gpus", "total_kwh", "emissions_avg_kg", "emissions_marg_kg",
+  "deadline_misses", "mean_added_delay_hours", "gpu_utilisation"
+];
+const SUMMARY_NULLABLE_COLUMNS = new Set([
+  "emissions_marg_kg", "mean_added_delay_hours", "gpu_utilisation"
+]);
+function validateSummaryCSV(text){
+  const {header, rows} = parseCSV(text);
+  const duplicates = header.filter((name,index)=>header.indexOf(name)!==index);
+  if (duplicates.length) return {error:"Duplicate column name: "+duplicates[0]};
+  const missing = SUMMARY_REQUIRED_COLUMNS.filter(name=>!header.includes(name));
+  if (missing.length) return {error:"Missing required column(s): "+missing.join(", ")};
+  if (!rows.length) return {error:"The CSV has headers but no data rows."};
+
+  const parsed = [];
+  for (let index=0; index<rows.length; index++){
+    const row = rows[index], line = index+2;
+    const policy = (row.policy||"").trim();
+    if (!policy) return {error:"Row "+line+": policy must not be empty."};
+    const k = Number(row.k);
+    if (!Number.isInteger(k) || k<=0) return {error:"Row "+line+": k must be a positive integer."};
+    const gpuText = (row.gpus||"").trim().toLowerCase();
+    const gpus = gpuText==="unlimited" ? "unlimited" : Number(gpuText);
+    if (gpus!=="unlimited" && (!Number.isInteger(gpus) || gpus<=0)){
+      return {error:"Row "+line+": gpus must be a positive integer or 'unlimited'."};
+    }
+
+    const metrics = {};
+    for (const column of SUMMARY_REQUIRED_COLUMNS){
+      if (column==="policy"||column==="k"||column==="gpus") continue;
+      const raw = (row[column]||"").trim();
+      const nullable = SUMMARY_NULLABLE_COLUMNS.has(column);
+      if (nullable && (!raw || /^(nan|null)$/i.test(raw))){
+        metrics[column] = null;
+        continue;
+      }
+      const value = Number(raw);
+      if (!raw || !Number.isFinite(value)){
+        return {error:"Row "+line+": "+column+" must be a finite number"+(nullable?" or blank":"")+"."};
+      }
+      if ((column==="total_kwh"||column==="emissions_avg_kg"||column==="emissions_marg_kg"
+          ||column==="deadline_misses"||column==="gpu_utilisation") && value<0){
+        return {error:"Row "+line+": "+column+" cannot be negative."};
+      }
+      if (column==="deadline_misses" && !Number.isInteger(value)){
+        return {error:"Row "+line+": deadline_misses must be an integer."};
+      }
+      metrics[column] = value;
+    }
+    parsed.push({policy,k,gpus,...metrics});
+  }
+  return {rows:parsed};
+}
+function setSummaryStatus(ok,text){
+  const status = document.getElementById("summaryStatus");
+  status.textContent = ok ? "validated" : "check file";
+  status.className = "status-pill "+(ok?"ok":"warn");
+  document.getElementById("summaryStatusMessage").textContent = text;
+}
+function loadSummaryFile(file){
+  upload.summaryRows = [];
+  upload.summaryFileName = null;
+  const reader = new FileReader();
+  reader.onload = ()=>{
+    const result = validateSummaryCSV(String(reader.result||""));
+    if (result.error){
+      setSummaryStatus(false,file.name+": "+result.error);
+      return;
+    }
+    upload.summaryRows = result.rows;
+    upload.summaryFileName = file.name;
+    setSummaryStatus(true,file.name+" validated · "+result.rows.length+" result rows loaded.");
+  };
+  reader.onerror = ()=>{
+    setSummaryStatus(false,"Could not read "+file.name+". Try selecting the file again.");
+  };
+  reader.readAsText(file);
+}
 
 function loadTruthFile(file){
   const reader = new FileReader();
@@ -1170,6 +1258,9 @@ document.getElementById("delaySel2").addEventListener("change", runUploadedScena
 document.getElementById("gpuSel2").addEventListener("change", runUploadedScenario);
 document.getElementById("truthFile").addEventListener("change", e=>{ if (e.target.files[0]) loadTruthFile(e.target.files[0]); });
 document.getElementById("fcFiles").addEventListener("change", e=>{ if (e.target.files.length) loadForecastFiles(e.target.files); });
+document.getElementById("summaryFile").addEventListener("change", e=>{
+  if (e.target.files[0]) loadSummaryFile(e.target.files[0]);
+});
 
 document.getElementById("modeDemoBtn").addEventListener("click", ()=>{
   state.mode="demo";
