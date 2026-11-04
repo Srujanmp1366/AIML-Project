@@ -42,6 +42,38 @@ def test_mid_hour_finish_uses_partial_hour_energy() -> None:
     assert per_job.loc[0, "finish_time"] == times[0] + pd.Timedelta(minutes=30)
 
 
+def test_mid_hour_arrival_starts_immediately_and_uses_hourly_ci() -> None:
+    truth, forecasts, times = _frames(1)
+    arrival = times[0] + pd.Timedelta(minutes=20)
+    truth.loc[truth["time"] == times[0], "actual_ci"] = 400.0
+    jobs = _jobs(("mid-hour", arrival, 0.5, 1, False))
+
+    metrics, per_job = run_sim("run_now", 6, 1, jobs, truth, forecasts, times[0], times[1])
+
+    assert per_job.loc[0, "start_time"] == arrival
+    assert per_job.loc[0, "finish_time"] == arrival + pd.Timedelta(minutes=30)
+    assert metrics["total_kwh"] == pytest.approx(0.3)
+    assert metrics["emissions_avg_kg"] == pytest.approx(0.3 * 400 / 1000)
+
+
+def test_new_inference_arrival_preempts_running_training_job() -> None:
+    truth, forecasts, times = _frames(3)
+    arrival = times[0] + pd.Timedelta(minutes=30)
+    jobs = _jobs(
+        ("training", times[0], 2.0, 1, True),
+        ("inference", arrival, 0.5, 1, False),
+    )
+
+    metrics, per_job = run_sim("run_now", 6, 1, jobs, truth, forecasts, times[0], times[3])
+
+    training = per_job.set_index("job_id").loc["training"]
+    inference = per_job.set_index("job_id").loc["inference"]
+    assert inference["start_time"] == arrival
+    assert inference["finish_time"] == times[1]
+    assert training["finish_time"] == times[2] + pd.Timedelta(minutes=30)
+    assert metrics["total_kwh"] == pytest.approx(1.55)
+
+
 def test_resume_adds_exactly_five_minutes_of_energy() -> None:
     truth, forecasts, times = _frames(3)
     jobs = _jobs(("resume", times[0], 2.0, 1, True))

@@ -1,0 +1,1300 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>Carbon-Aware Scheduler</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+/* ===== Design tokens ===== */
+/* Layout: sticky scenario/upload control bar over stacked panels (accuracy table, CI chart,
+   emissions chart, KPI cards, k-sweep + hour-of-day charts, capacity panel), then tabs for the
+   per-job timeline grid and the animated rack/map view. One "control room" surface throughout. */
+:root{
+  --bg:#f2f5f3;
+  --surface:#ffffff;
+  --surface-2:#eaf0ec;
+  --surface-3:#dde8e1;
+  --border:#cdddd4;
+  --fg:#0f1f1a;
+  --fg-dim:#4d6359;
+  --fg-faint:#7f9389;
+  --accent:#0c8f68;
+  --accent-fg:#ffffff;
+  --accent-soft:#d8f0e4;
+  --accent2:#3a6fb0;
+  --accent2-soft:#dbe8f5;
+  --warn:#a3650b;
+  --warn-soft:#f6e6cc;
+  --crit:#b23a31;
+  --crit-soft:#f7dcd9;
+  --good:#0c8f68;
+  --ci-clean:#1fa876;
+  --ci-mid:#d7a52c;
+  --ci-dirty:#c24a3c;
+  --shadow:0 1px 2px rgba(15,31,26,.06), 0 8px 24px -12px rgba(15,31,26,.18);
+  --font-display:'Barlow Condensed',sans-serif;
+  --font-body:'Source Sans 3',sans-serif;
+  --font-mono:'JetBrains Mono',monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0a1310; --surface:#111c17; --surface-2:#16221c; --surface-3:#1d2b23;
+    --border:#28392f; --fg:#e9f3ee; --fg-dim:#9ab3a7; --fg-faint:#6c8579;
+    --accent:#35d6a3; --accent-fg:#06281c; --accent-soft:#163a2c;
+    --accent2:#6fb0ef; --accent2-soft:#162634;
+    --warn:#e3ab46; --warn-soft:#3a2e13; --crit:#ef6a5d; --crit-soft:#3c1c18;
+    --good:#35d6a3; --ci-clean:#35d6a3; --ci-mid:#e3ab46; --ci-dirty:#ef6a5d;
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 12px 28px -14px rgba(0,0,0,.6);
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0a1310; --surface:#111c17; --surface-2:#16221c; --surface-3:#1d2b23;
+  --border:#28392f; --fg:#e9f3ee; --fg-dim:#9ab3a7; --fg-faint:#6c8579;
+  --accent:#35d6a3; --accent-fg:#06281c; --accent-soft:#163a2c;
+  --accent2:#6fb0ef; --accent2-soft:#162634;
+  --warn:#e3ab46; --warn-soft:#3a2e13; --crit:#ef6a5d; --crit-soft:#3c1c18;
+  --good:#35d6a3; --ci-clean:#35d6a3; --ci-mid:#e3ab46; --ci-dirty:#ef6a5d;
+  --shadow:0 1px 2px rgba(0,0,0,.3), 0 12px 28px -14px rgba(0,0,0,.6);
+  color-scheme:dark;
+}
+
+*{box-sizing:border-box}
+body{
+  background:var(--bg); color:var(--fg); font-family:var(--font-body); font-size:15px; line-height:1.45;
+  padding-left:max(16px, env(safe-area-inset-left,0px));
+  padding-right:max(16px, env(safe-area-inset-right,0px));
+}
+h1,h2,h3{font-family:var(--font-display);font-weight:600;text-wrap:balance;margin:0}
+.mono{font-family:var(--font-mono)}
+.tnum{font-variant-numeric:tabular-nums}
+button{font-family:inherit}
+::selection{background:var(--accent-soft)}
+
+.wrap{max-width:1180px;margin:0 auto;padding-block:28px 56px}
+
+header.page{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:flex-end;justify-content:space-between;margin-bottom:6px}
+.title-block{min-width:260px}
+.eyebrow{display:inline-flex;align-items:center;gap:6px;font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);background:var(--accent-soft);padding:3px 9px;border-radius:999px;margin-bottom:10px}
+.eyebrow .dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}
+h1.pagetitle{font-size:clamp(26px,4vw,38px);letter-spacing:.01em}
+.sub{color:var(--fg-dim);font-size:14.5px;max-width:60ch;margin-top:4px}
+.proto-note{font-size:12.5px;color:var(--fg-faint);margin-top:10px;max-width:62ch}
+
+/* ---- Mode switch + controls ---- */
+.mode-switch{display:inline-flex;border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:20px 0 12px}
+.mode-btn{font-family:var(--font-display);font-size:15px;font-weight:600;padding:9px 18px;background:var(--surface);color:var(--fg-dim);border:none;cursor:pointer}
+.mode-btn[aria-pressed="true"]{background:var(--accent);color:var(--accent-fg)}
+
+.controls{
+  display:flex;flex-wrap:wrap;gap:14px 22px;align-items:flex-end;
+  background:var(--surface);border:1px solid var(--border);border-radius:14px;
+  padding:16px 18px;margin:0 0 14px;box-shadow:var(--shadow);
+}
+.controls[hidden]{display:none}
+.ctrl{display:flex;flex-direction:column;gap:6px}
+.ctrl label{font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg-faint);font-weight:600}
+select, .btn{
+  font-family:var(--font-body);font-size:14px;font-weight:600;color:var(--fg);
+  background:var(--surface-2);border:1px solid var(--border);border-radius:9px;
+  padding:9px 12px;cursor:pointer;
+}
+select{min-width:148px}
+.btn{display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+.btn.primary:hover{filter:brightness(1.06)}
+.btn svg{width:14px;height:14px}
+.ctrl-grow{flex:1 1 auto}
+
+.upload-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:760px){.upload-grid{grid-template-columns:1fr}}
+.upload-card{border:1.5px dashed var(--border);border-radius:12px;padding:14px 16px;background:var(--surface-2)}
+.upload-card h4{font-family:var(--font-display);font-size:15px;margin-bottom:2px}
+.upload-card .fname{font-family:var(--font-mono);font-size:11.5px}
+.upload-card p.hint{font-size:12px;color:var(--fg-faint);margin:3px 0 10px}
+.file-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+input[type="file"]{font-size:12.5px;color:var(--fg-dim);max-width:100%}
+.status-pill{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;padding:3px 9px;border-radius:999px}
+.status-pill.ok{background:var(--accent-soft);color:var(--accent)}
+.status-pill.warn{background:var(--warn-soft);color:var(--warn)}
+.status-pill.off{background:var(--surface-3);color:var(--fg-faint)}
+.model-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.model-tag{font-family:var(--font-mono);font-size:11px;background:var(--surface-3);border:1px solid var(--border);border-radius:6px;padding:3px 7px}
+.upload-note{grid-column:1/-1;font-size:12px;color:var(--fg-faint)}
+
+/* ---- Sections ---- */
+.section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:34px 0 14px;flex-wrap:wrap}
+.section-head h2{font-size:21px}
+.section-head .hint{font-size:12.5px;color:var(--fg-faint)}
+
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow)}
+.panel h3{font-size:15.5px;margin-bottom:2px}
+.panel .pdesc{font-size:12.5px;color:var(--fg-faint);margin-bottom:12px}
+.chart-box{position:relative;height:220px}
+.chart-grid{display:grid;grid-template-columns:1.3fr 1fr;gap:14px}
+@media (max-width:860px){.chart-grid{grid-template-columns:1fr}}
+.chart-grid.even{grid-template-columns:1fr 1fr}
+@media (max-width:860px){.chart-grid.even{grid-template-columns:1fr}}
+
+/* ---- Accuracy table ---- */
+.acc-table{width:100%;border-collapse:collapse;font-size:13px}
+.acc-table th{text-align:left;font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--fg-faint);padding:6px 10px;border-bottom:1px solid var(--border)}
+.acc-table td{padding:8px 10px;border-bottom:1px solid var(--border);font-family:var(--font-mono)}
+.acc-table tr:last-child td{border-bottom:none}
+.acc-table td.model{font-family:var(--font-body);font-weight:600}
+.driving-badge{font-size:10px;font-family:var(--font-body);font-weight:700;color:var(--accent);background:var(--accent-soft);padding:1px 6px;border-radius:5px;margin-left:7px;vertical-align:middle}
+
+/* ---- Policy picker ---- */
+.policy-picker{display:flex;flex-wrap:wrap;gap:8px}
+.policy-chip{display:flex;align-items:center;gap:7px;border:1px solid var(--border);border-radius:9px;padding:7px 11px 7px 9px;cursor:pointer;background:var(--surface-2);user-select:none}
+.policy-chip input{accent-color:var(--accent)}
+.policy-chip span.swatch{width:9px;height:9px;border-radius:3px;flex:none}
+.policy-chip.off{opacity:.5}
+
+/* ---- KPI cards ---- */
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(248px,1fr));gap:12px}
+.kpi-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow);position:relative;overflow:hidden}
+.kpi-card .bar{position:absolute;left:0;top:0;bottom:0;width:4px}
+.kpi-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.kpi-head .swatch{width:10px;height:10px;border-radius:3px}
+.kpi-head .name{font-weight:700;font-size:14.5px}
+.kpi-row{display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;border-top:1px dashed var(--border)}
+.kpi-row:first-of-type{border-top:none}
+.kpi-row .label{font-size:11.5px;color:var(--fg-dim)}
+.kpi-row .value{font-family:var(--font-mono);font-weight:600;font-size:13.5px}
+.value.good{color:var(--good)}
+.value.crit{color:var(--crit)}
+.kpi-subhead{font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--fg-faint);margin-top:10px}
+
+/* ---- Capacity compare ---- */
+.cap-compare{display:flex;gap:18px;flex-wrap:wrap}
+.cap-tile{flex:1 1 180px;background:var(--surface-2);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
+.cap-tile .stat-label{font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--fg-faint)}
+.cap-tile .big-stat{font-family:var(--font-mono);font-size:24px;font-weight:600;margin-top:4px}
+.cap-tile .big-stat .unit{font-size:12px;color:var(--fg-dim);font-weight:500;margin-left:3px}
+
+/* ---- Tabs ---- */
+.tabs{display:flex;gap:6px;border-bottom:1px solid var(--border);margin:36px 0 0}
+.tab{font-family:var(--font-display);font-size:16px;font-weight:600;color:var(--fg-dim);background:none;border:none;padding:10px 4px;margin-right:18px;cursor:pointer;position:relative}
+.tab[aria-selected="true"]{color:var(--fg)}
+.tab[aria-selected="true"]::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--accent)}
+.tabpanel{padding-top:18px}
+.tabpanel[hidden]{display:none}
+
+.inspect-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;margin-bottom:14px}
+.inspect-row .ctrl{min-width:170px}
+.legend-inline{display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:var(--fg-dim)}
+.legend-inline .lg{display:inline-flex;align-items:center;gap:6px}
+.legend-inline .sw{width:10px;height:10px;border-radius:2px}
+
+/* ---- Job grid timeline ---- */
+.job-timeline{background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);overflow:hidden}
+.jt-scroll{overflow-x:auto}
+.jt-table{border-collapse:collapse;width:max-content}
+.jt-table th{position:sticky;top:0;background:var(--surface);z-index:1}
+.jt-rowlabel{position:sticky;left:0;background:var(--surface);z-index:2;padding:0 12px;text-align:left;border-right:1px solid var(--border);min-width:150px;max-width:150px}
+.jt-rowlabel .jid{font-family:var(--font-mono);font-weight:700;font-size:12.5px}
+.jt-rowlabel .meta{font-size:11px;color:var(--fg-faint);margin-top:1px}
+.jt-hourhead{font-family:var(--font-mono);font-size:9.5px;color:var(--fg-faint);text-align:center;padding:6px 0;min-width:10px;border-right:1px solid var(--border)}
+.jt-hourhead.major{color:var(--fg-dim);font-weight:600}
+.jt-cell{width:10px;height:26px;border-right:1px solid var(--border);border-top:1px solid var(--border)}
+tr.jt-row:last-child .jt-cell, tr.jt-row:last-child .jt-rowlabel{border-bottom:1px solid var(--border)}
+.jt-cell.run{background:var(--accent)}
+.jt-cell.wait{background:var(--surface-3)}
+.jt-cell.missed{background:var(--crit)}
+.jt-cell.idle{background:transparent}
+.jt-cell.deadline{box-shadow:inset 2px 0 0 var(--crit)}
+
+/* ---- Map / rack view ---- */
+.map-shell{display:grid;grid-template-columns:1fr 280px;gap:16px}
+@media (max-width:860px){.map-shell{grid-template-columns:1fr}}
+.rack-panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px;box-shadow:var(--shadow)}
+.rack-floor{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin:16px 0 6px}
+.rack{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:7px;display:flex;flex-direction:column;gap:4px}
+.gpu{aspect-ratio:1;border-radius:3px;background:var(--surface-3);transition:background .25s,box-shadow .25s}
+.gpu.busy{background:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.gpu.busy.dirty{background:var(--ci-dirty)}
+.gpu.busy.mid{background:var(--ci-mid)}
+.rack-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:3px}
+
+.side-stat{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:14px}
+.ci-gauge{display:flex;flex-direction:column;gap:6px}
+.ci-track{height:10px;border-radius:999px;background:linear-gradient(90deg,var(--ci-clean),var(--ci-mid),var(--ci-dirty));position:relative}
+.ci-knob{position:absolute;top:-3px;width:16px;height:16px;border-radius:50%;background:var(--surface);border:2px solid var(--fg);transform:translateX(-50%)}
+.big-stat{font-family:var(--font-mono);font-size:26px;font-weight:600}
+.big-stat .unit{font-size:13px;color:var(--fg-dim);font-weight:500;margin-left:4px}
+.stat-label{font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--fg-faint)}
+
+.scrub-row{display:flex;align-items:center;gap:10px;margin-top:14px}
+input[type="range"]{flex:1;accent-color:var(--accent)}
+.play-btn{width:34px;height:34px;border-radius:50%;border:1px solid var(--border);background:var(--surface-2);display:flex;align-items:center;justify-content:center;cursor:pointer;flex:none}
+.play-btn svg{width:14px;height:14px;fill:var(--fg)}
+.clock{font-family:var(--font-mono);font-size:13px;min-width:92px;text-align:right}
+
+.queue-list{display:flex;flex-direction:column;gap:6px;max-height:150px;overflow-y:auto}
+.queue-item{display:flex;justify-content:space-between;font-size:12px;padding:5px 8px;border-radius:7px;background:var(--surface-2)}
+.queue-item .jid{font-family:var(--font-mono);font-weight:600}
+.queue-item.must{color:var(--crit)}
+
+footer.page{margin-top:48px;padding-top:18px;border-top:1px solid var(--border);font-size:12px;color:var(--fg-faint);display:flex;flex-direction:column;gap:4px}
+
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="wrap">
+
+  <header class="page">
+    <div class="title-block">
+      <span class="eyebrow"><span class="dot"></span><span id="eyebrowText">Demo scenario &middot; synthetic data</span></span>
+      <h1 class="pagetitle">Carbon-Aware Scheduler</h1>
+      <p class="sub">A forecast-driven scheduler that shifts delay-tolerant GPU jobs into cleaner hours on the Indian grid, scored against a carbon-agnostic baseline &mdash; under both average and marginal emissions accounting.</p>
+      <p class="proto-note">Matches the team spec&#8217;s interface: upload <span class="mono">grid_truth.csv</span> (actual CI + MEF) and one or more <span class="mono">forecasts_&lt;model&gt;.csv</span> files to drive this from real data. Jobs stay synthetic (Alibaba-trace-like) until the simulator&#8217;s own job/results format is finalized.</p>
+    </div>
+  </header>
+
+  <div class="mode-switch" role="tablist" aria-label="Data source">
+    <button class="mode-btn" id="modeDemoBtn" aria-pressed="true">Demo scenario</button>
+    <button class="mode-btn" id="modeUploadBtn" aria-pressed="false">Uploaded CSVs</button>
+  </div>
+
+  <div class="controls" id="demoControls">
+    <div class="ctrl">
+      <label for="regionSel">Grid region</label>
+      <select id="regionSel">
+        <option value="south">Southern grid &mdash; solar-heavy</option>
+        <option value="west">Western grid &mdash; mixed</option>
+        <option value="east" selected>Eastern grid &mdash; coal-dominant</option>
+      </select>
+    </div>
+    <div class="ctrl">
+      <label for="delaySel">Allowed delay, k</label>
+      <select id="delaySel">
+        <option value="6">6 hours</option>
+        <option value="12">12 hours</option>
+        <option value="24" selected>24 hours</option>
+        <option value="48">48 hours</option>
+      </select>
+    </div>
+    <div class="ctrl">
+      <label for="gpuSel">Cluster capacity</label>
+      <select id="gpuSel">
+        <option value="32">32 GPUs</option>
+        <option value="64" selected>64 GPUs</option>
+        <option value="128">128 GPUs</option>
+      </select>
+    </div>
+    <div class="ctrl ctrl-grow">
+      <label>&nbsp;</label>
+      <button class="btn primary" id="regenBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-2.6-6.36"/><path d="M21 3v6h-6"/></svg>
+        Regenerate scenario
+      </button>
+    </div>
+  </div>
+
+  <div class="controls" id="uploadControls" hidden>
+    <div class="upload-grid">
+      <div class="upload-card">
+        <h4>grid_truth.csv <span class="status-pill off" id="truthStatus">not loaded</span></h4>
+        <p class="hint">Columns: <span class="mono">time, actual_ci, mef</span> &mdash; one row per hour. Defines the timeline everything else is scored against.</p>
+        <div class="file-row"><input type="file" id="truthFile" accept=".csv"></div>
+      </div>
+      <div class="upload-card">
+        <h4>forecasts_&lt;model&gt;.csv <span class="status-pill off" id="fcStatus">not loaded</span></h4>
+        <p class="hint">Columns: <span class="mono">issue_time, target_time, predicted_ci</span>. Upload one or more &mdash; file name after "forecasts_" becomes the model label. Select multiple files at once.</p>
+        <div class="file-row"><input type="file" id="fcFiles" accept=".csv" multiple></div>
+        <div class="model-tags" id="modelTags"></div>
+      </div>
+      <div class="upload-card">
+        <h4>Python sweep summary <span class="status-pill off" id="summaryStatus">not loaded</span></h4>
+        <p class="hint">Validate the scheduler output CSV with policy, k, GPU capacity, energy, emissions, deadline, delay, and utilization metrics.</p>
+        <div class="file-row"><input type="file" id="summaryFile" accept=".csv"></div>
+        <p class="hint" id="summaryStatusMessage" role="status" aria-live="polite">Expected output: <span class="mono">results/summary.csv</span>. This validates and stores the rows; it does not yet drive the dashboard charts.</p>
+      </div>
+      <div class="upload-note" id="uploadNote">Upload <strong>grid_truth.csv</strong> to activate the timeline. A forecast file is optional &mdash; without one, the scheduler falls back to a same-hour-yesterday naive forecast.</div>
+    </div>
+    <div class="ctrl">
+      <label for="delaySel2">Allowed delay, k</label>
+      <select id="delaySel2">
+        <option value="6">6 hours</option>
+        <option value="12">12 hours</option>
+        <option value="24" selected>24 hours</option>
+        <option value="48">48 hours</option>
+      </select>
+    </div>
+    <div class="ctrl">
+      <label for="gpuSel2">Cluster capacity</label>
+      <select id="gpuSel2">
+        <option value="32">32 GPUs</option>
+        <option value="64" selected>64 GPUs</option>
+        <option value="128">128 GPUs</option>
+      </select>
+    </div>
+    <div class="ctrl">
+      <label for="modelSel">Driving model</label>
+      <select id="modelSel"><option value="">(none loaded)</option></select>
+    </div>
+  </div>
+
+  <div class="section-head">
+    <h2>Forecast accuracy</h2>
+    <span class="hint">MAE / MAPE vs. actual CI &middot; rank accuracy = mean Spearman correlation within each 24h forecast window</span>
+  </div>
+  <div class="panel">
+    <table class="acc-table" id="accTable"></table>
+  </div>
+
+  <div class="chart-grid" style="margin-top:14px">
+    <div class="panel">
+      <h3>Grid carbon intensity &mdash; forecast vs. actual</h3>
+      <p class="pdesc" id="ciChartDesc">Day-ahead forecast (dashed) against realized intensity, over the scenario window.</p>
+      <div class="chart-box"><canvas id="ciChart"></canvas></div>
+    </div>
+    <div class="panel">
+      <h3>Carbon emitted by policy</h3>
+      <p class="pdesc">Average accounting (solid) vs. marginal accounting (hatched) &mdash; gCO&#8322;.</p>
+      <div class="chart-box"><canvas id="emChart"></canvas></div>
+    </div>
+  </div>
+
+  <div class="section-head">
+    <h2>Policy comparison</h2>
+    <span class="hint">pick which policies to compare, run against the same job trace</span>
+  </div>
+  <div class="policy-picker" id="policyPicker"></div>
+  <div class="kpi-grid" id="kpiGrid" style="margin-top:14px"></div>
+
+  <div class="chart-grid even" style="margin-top:28px">
+    <div class="panel">
+      <h3>CO&#8322; saved vs. allowed delay, k</h3>
+      <p class="pdesc">Forecast-greedy and Oracle, average and marginal accounting, vs. the run-now baseline at each k.</p>
+      <div class="chart-box"><canvas id="kChart"></canvas></div>
+    </div>
+    <div class="panel">
+      <h3>CI and MEF by hour of day</h3>
+      <p class="pdesc">Mean actual carbon intensity and marginal emission factor, averaged across the window.</p>
+      <div class="chart-box"><canvas id="hodChart"></canvas></div>
+    </div>
+  </div>
+
+  <div class="section-head">
+    <h2>Realistic vs. unlimited capacity</h2>
+    <span class="hint">how much of the idealised saving survives GPU limits, at the current k</span>
+  </div>
+  <div class="panel">
+    <div class="cap-compare" id="capCompare"></div>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" id="tabBtnJobs" aria-selected="true">GPU &amp; job view</button>
+    <button class="tab" role="tab" id="tabBtnMap" aria-selected="false">Grid map view</button>
+  </div>
+
+  <div class="tabpanel" id="tabJobs" role="tabpanel">
+    <div class="inspect-row">
+      <div class="ctrl">
+        <label for="inspectSel">Inspect policy</label>
+        <select id="inspectSel"></select>
+      </div>
+      <div class="legend-inline">
+        <span class="lg"><span class="sw" style="background:var(--accent)"></span>running</span>
+        <span class="lg"><span class="sw" style="background:var(--surface-3)"></span>waiting</span>
+        <span class="lg"><span class="sw" style="background:var(--crit)"></span>deadline missed</span>
+        <span class="lg"><span class="sw" style="box-shadow:inset 2px 0 0 var(--crit);background:var(--surface)"></span>deadline hour</span>
+      </div>
+    </div>
+    <div class="job-timeline">
+      <div class="jt-scroll">
+        <table class="jt-table" id="jtTable"></table>
+      </div>
+    </div>
+  </div>
+
+  <div class="tabpanel" id="tabMap" role="tabpanel" hidden>
+    <div class="inspect-row">
+      <div class="ctrl">
+        <label for="inspectSel2">Inspect policy</label>
+        <select id="inspectSel2"></select>
+      </div>
+    </div>
+    <div class="map-shell">
+      <div class="rack-panel">
+        <h3 style="margin-bottom:2px">Data center floor</h3>
+        <p class="pdesc">Each tile is one GPU. Lit tiles are running a job this hour; color marks how clean that hour&#8217;s grid is.</p>
+        <div class="rack-floor" id="rackFloor"></div>
+        <div class="scrub-row">
+          <button class="play-btn" id="playBtn" aria-label="Play">
+            <svg viewBox="0 0 24 24"><path id="playIcon" d="M8 5v14l11-7z"/></svg>
+          </button>
+          <input type="range" id="hourScrub" min="0" max="0" value="0">
+          <span class="clock mono tnum" id="clockLabel">h00</span>
+        </div>
+      </div>
+      <div class="side-stat">
+        <div>
+          <div class="stat-label">Carbon intensity, this hour</div>
+          <div class="big-stat tnum" id="mapCiValue">&mdash;<span class="unit">gCO&#8322;/kWh</span></div>
+          <div class="ci-gauge" style="margin-top:8px">
+            <div class="ci-track"><div class="ci-knob" id="ciKnob" style="left:0%"></div></div>
+          </div>
+        </div>
+        <div>
+          <div class="stat-label">MEF, this hour</div>
+          <div class="big-stat tnum" id="mapMefValue">&mdash;<span class="unit">gCO&#8322;/kWh</span></div>
+        </div>
+        <div>
+          <div class="stat-label">GPU utilization</div>
+          <div class="big-stat tnum" id="mapUtilValue">&mdash;<span class="unit">%</span></div>
+        </div>
+        <div>
+          <div class="stat-label">Waiting queue</div>
+          <div class="queue-list" id="queueList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="page">
+    <span>0.4kW/GPU &middot; PUE 1.5 &middot; 5 min checkpoint cost per resume &middot; deadline = arrival + k &middot; re-plans every hour from the forecast issued that hour</span>
+    <span>Built for the AIML carbon-aware scheduling project</span>
+  </footer>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* ====================================================================
+   CONSTANTS (per method spec)
+==================================================================== */
+const GPU_POWER_KW = 0.4;
+const PUE = 1.5;
+const CHECKPOINT_HOURS = 5/60;
+const POLICIES = [
+  {id:"runnow", name:"Run now", color:"#8a9a92", desc:"No carbon awareness — runs as soon as capacity allows."},
+  {id:"threshold", name:"Threshold", color:"#4f8fd1", desc:"Runs when forecast CI is below the trailing median."},
+  {id:"greedy", name:"Forecast-greedy", color:"#0c8f68", desc:"Fills each job's cleanest forecast hours before its deadline."},
+  {id:"oracle", name:"Oracle", color:"#9a6bd1", desc:"Same as forecast-greedy, using actual CI (upper bound)."}
+];
+function policyColorDark(id){ return {runnow:"#9fb3a9", threshold:"#6fb0ef", greedy:"#35d6a3", oracle:"#b48be8"}[id]; }
+
+/* ====================================================================
+   PRNG (demo mode only)
+==================================================================== */
+let seed = 20261103;
+function mulberry32(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+let rng = mulberry32(seed);
+
+/* ====================================================================
+   CSV parsing
+==================================================================== */
+function parseCSV(text){
+  const lines = text.replace(/\r/g,"").split("\n").filter(l=>l.trim().length>0);
+  if (lines.length<2) return {header:[], rows:[]};
+  const header = lines[0].replace(/^\uFEFF/,"").split(",").map(s=>s.trim());
+  const rows = lines.slice(1).map(line=>{
+    const cells = line.split(",").map(s=>s.trim());
+    const obj = {};
+    header.forEach((h,i)=> obj[h]=cells[i]);
+    return obj;
+  });
+  return {header, rows};
+}
+function toHourEpoch(iso){
+  const t = Date.parse(iso);
+  if (isNaN(t)) return null;
+  return Math.floor(t/3600000);
+}
+
+/* ====================================================================
+   Demo scenario generation
+==================================================================== */
+const DEMO_HORIZON = 96;
+const REGIONS = {
+  south:{label:"Southern grid", base:560, amp:230, floor:300, noise:18},
+  west: {label:"Western grid",  base:640, amp:190, floor:380, noise:20},
+  east: {label:"Eastern grid",  base:830, amp:70,  floor:690, noise:14}
+};
+function genDemoTimeline(region){
+  const cfg = REGIONS[region];
+  const actual = new Array(DEMO_HORIZON), forecast = new Array(DEMO_HORIZON), mef = new Array(DEMO_HORIZON);
+  for (let h=0; h<DEMO_HORIZON; h++){
+    const hod = h%24;
+    const solar = Math.max(0, Math.cos(((hod-13)/24)*2*Math.PI));
+    const dayCycle = cfg.base - cfg.amp*solar;
+    const drift = Math.sin(h/37)*18;
+    actual[h] = Math.max(cfg.floor*0.85, dayCycle + drift + (rng()-0.5)*2*cfg.noise);
+  }
+  for (let h=0; h<DEMO_HORIZON; h++) forecast[h] = Math.max(50, actual[h] + (rng()-0.5)*2*(cfg.noise*2.1));
+  for (let h=0; h<DEMO_HORIZON; h++){
+    const hod = h%24;
+    const noonFactor = 0.82 + 0.18*Math.cos(((hod-13)/24)*2*Math.PI); // slightly cleaner margin near noon
+    mef[h] = Math.max(80, actual[h]*noonFactor*1.08 + (rng()-0.5)*2*cfg.noise*0.6);
+  }
+  return {actual, forecast, mef, h0:0};
+}
+function genJobsBase(capacity){
+  const GPU_OPTS = [1,2,4,8,8,4,2];
+  const n = Math.max(14, Math.round(capacity/4));
+  const jobs = [];
+  const lastArrival = DEMO_HORIZON - 56;
+  for (let i=0;i<n;i++){
+    const gpus = GPU_OPTS[Math.floor(rng()*GPU_OPTS.length)];
+    const duration = 1 + Math.floor(rng()*5); // 1..5h, fits even k=6
+    const arrival = Math.floor(rng()*Math.max(1,lastArrival));
+    jobs.push({id:"J"+String(i+1).padStart(2,"0"), gpus, duration, arrival});
+  }
+  jobs.sort((a,b)=>a.arrival-b.arrival);
+  return jobs;
+}
+
+/* ====================================================================
+   Uploaded-data model
+==================================================================== */
+let upload = {
+  truthLoaded:false, truthRows:[], h0:0, horizon:0,
+  actual:[], mef:[],
+  models:{}, // name -> {rows:[{issue,target,pred}], byIssue: Map(issueH -> Map(targetH->pred))}
+  driving:null,
+  summaryRows:[],
+  summaryFileName:null
+};
+
+const SUMMARY_REQUIRED_COLUMNS = [
+  "policy", "k", "gpus", "total_kwh", "emissions_avg_kg", "emissions_marg_kg",
+  "deadline_misses", "mean_added_delay_hours", "gpu_utilisation"
+];
+const SUMMARY_NULLABLE_COLUMNS = new Set([
+  "emissions_marg_kg", "mean_added_delay_hours", "gpu_utilisation"
+]);
+function validateSummaryCSV(text){
+  const {header, rows} = parseCSV(text);
+  const duplicates = header.filter((name,index)=>header.indexOf(name)!==index);
+  if (duplicates.length) return {error:"Duplicate column name: "+duplicates[0]};
+  const missing = SUMMARY_REQUIRED_COLUMNS.filter(name=>!header.includes(name));
+  if (missing.length) return {error:"Missing required column(s): "+missing.join(", ")};
+  if (!rows.length) return {error:"The CSV has headers but no data rows."};
+
+  const parsed = [];
+  for (let index=0; index<rows.length; index++){
+    const row = rows[index], line = index+2;
+    const policy = (row.policy||"").trim();
+    if (!policy) return {error:"Row "+line+": policy must not be empty."};
+    const k = Number(row.k);
+    if (!Number.isInteger(k) || k<=0) return {error:"Row "+line+": k must be a positive integer."};
+    const gpuText = (row.gpus||"").trim().toLowerCase();
+    const gpus = gpuText==="unlimited" ? "unlimited" : Number(gpuText);
+    if (gpus!=="unlimited" && (!Number.isInteger(gpus) || gpus<=0)){
+      return {error:"Row "+line+": gpus must be a positive integer or 'unlimited'."};
+    }
+
+    const metrics = {};
+    for (const column of SUMMARY_REQUIRED_COLUMNS){
+      if (column==="policy"||column==="k"||column==="gpus") continue;
+      const raw = (row[column]||"").trim();
+      const nullable = SUMMARY_NULLABLE_COLUMNS.has(column);
+      if (nullable && (!raw || /^(nan|null)$/i.test(raw))){
+        metrics[column] = null;
+        continue;
+      }
+      const value = Number(raw);
+      if (!raw || !Number.isFinite(value)){
+        return {error:"Row "+line+": "+column+" must be a finite number"+(nullable?" or blank":"")+"."};
+      }
+      if ((column==="total_kwh"||column==="emissions_avg_kg"||column==="emissions_marg_kg"
+          ||column==="deadline_misses"||column==="gpu_utilisation") && value<0){
+        return {error:"Row "+line+": "+column+" cannot be negative."};
+      }
+      if (column==="deadline_misses" && !Number.isInteger(value)){
+        return {error:"Row "+line+": deadline_misses must be an integer."};
+      }
+      metrics[column] = value;
+    }
+    parsed.push({policy,k,gpus,...metrics});
+  }
+  return {rows:parsed};
+}
+function setSummaryStatus(ok,text){
+  const status = document.getElementById("summaryStatus");
+  status.textContent = ok ? "validated" : "check file";
+  status.className = "status-pill "+(ok?"ok":"warn");
+  document.getElementById("summaryStatusMessage").textContent = text;
+}
+function loadSummaryFile(file){
+  upload.summaryRows = [];
+  upload.summaryFileName = null;
+  const reader = new FileReader();
+  reader.onload = ()=>{
+    const result = validateSummaryCSV(String(reader.result||""));
+    if (result.error){
+      setSummaryStatus(false,file.name+": "+result.error);
+      return;
+    }
+    upload.summaryRows = result.rows;
+    upload.summaryFileName = file.name;
+    setSummaryStatus(true,file.name+" validated · "+result.rows.length+" result rows loaded.");
+  };
+  reader.onerror = ()=>{
+    setSummaryStatus(false,"Could not read "+file.name+". Try selecting the file again.");
+  };
+  reader.readAsText(file);
+}
+
+function loadTruthFile(file){
+  const reader = new FileReader();
+  reader.onload = ()=>{
+    const {rows} = parseCSV(reader.result);
+    const parsed = rows.map(r=>({
+      h: toHourEpoch(r.time), actual:parseFloat(r.actual_ci), mef: r.mef!==undefined?parseFloat(r.mef):NaN
+    })).filter(r=> r.h!==null && !isNaN(r.actual));
+    if (parsed.length<2){ setTruthStatus(false,"couldn't parse — check the time/actual_ci columns"); return; }
+    parsed.sort((a,b)=>a.h-b.h);
+    const h0 = parsed[0].h, h1 = parsed[parsed.length-1].h;
+    const horizon = Math.min(h1-h0+1, 24*60); // cap at ~60 days for render sanity
+    const actual = new Array(horizon).fill(null);
+    const mef = new Array(horizon).fill(null);
+    parsed.forEach(r=>{ const idx=r.h-h0; if (idx>=0 && idx<horizon){ actual[idx]=r.actual; mef[idx]=isNaN(r.mef)?null:r.mef; } });
+    forwardFill(actual); forwardFill(mef, actual.map(v=>v*0.98));
+    upload.truthLoaded = true; upload.h0 = h0; upload.horizon = horizon;
+    upload.actual = actual; upload.mef = mef;
+    setTruthStatus(true, parsed.length+" rows · "+horizon+"h span");
+    updateModelSelect(); maybeActivateUpload();
+  };
+  reader.readAsText(file);
+}
+function forwardFill(arr, fallback){
+  let last = arr.find(v=>v!==null && v!==undefined);
+  if (last===undefined) last = 0;
+  for (let i=0;i<arr.length;i++){
+    if (arr[i]===null || arr[i]===undefined || isNaN(arr[i])) arr[i] = fallback ? fallback[i] : last;
+    else last = arr[i];
+  }
+}
+function loadForecastFiles(fileList){
+  Array.from(fileList).forEach(file=>{
+    const name = file.name.replace(/^forecasts_/i,"").replace(/\.csv$/i,"") || file.name;
+    const reader = new FileReader();
+    reader.onload = ()=>{
+      const {rows} = parseCSV(reader.result);
+      const byIssue = new Map();
+      let count=0;
+      rows.forEach(r=>{
+        const ih = toHourEpoch(r.issue_time), th = toHourEpoch(r.target_time), pred = parseFloat(r.predicted_ci);
+        if (ih===null||th===null||isNaN(pred)) return;
+        if (!byIssue.has(ih)) byIssue.set(ih,new Map());
+        byIssue.get(ih).set(th, pred);
+        count++;
+      });
+      upload.models[name] = {byIssue, count};
+      if (!upload.driving) upload.driving = name;
+      setFcStatus(true, Object.keys(upload.models).length+" model(s) loaded");
+      renderModelTags();
+      updateModelSelect();
+      maybeActivateUpload();
+    };
+    reader.readAsText(file);
+  });
+}
+function setTruthStatus(ok, text){
+  const el = document.getElementById("truthStatus");
+  el.textContent = text; el.className = "status-pill "+(ok?"ok":"warn");
+}
+function setFcStatus(ok, text){
+  const el = document.getElementById("fcStatus");
+  el.textContent = text; el.className = "status-pill "+(ok?"ok":"warn");
+}
+function renderModelTags(){
+  document.getElementById("modelTags").innerHTML = Object.keys(upload.models).map(n=>`<span class="model-tag">${n} &middot; ${upload.models[n].count}</span>`).join("");
+}
+function updateModelSelect(){
+  const sel = document.getElementById("modelSel");
+  const names = Object.keys(upload.models);
+  if (names.length===0){ sel.innerHTML = '<option value="">(none — naive fallback)</option>'; return; }
+  sel.innerHTML = names.map(n=>`<option value="${n}" ${n===upload.driving?"selected":""}>${n}</option>`).join("");
+  sel.onchange = (e)=>{ upload.driving = e.target.value; runUploadedScenario(); };
+}
+function maybeActivateUpload(){
+  const note = document.getElementById("uploadNote");
+  if (upload.truthLoaded){
+    note.innerHTML = Object.keys(upload.models).length
+      ? "Timeline and forecast loaded — driving the scheduler from real data below."
+      : "Timeline loaded. No forecast file yet — the scheduler is using a same-hour-yesterday naive fallback until one is uploaded.";
+    runUploadedScenario();
+  }
+}
+
+/* ====================================================================
+   Forecast lookup (handles both demo arrays and uploaded models)
+==================================================================== */
+function seasonalNaive(actual, targetH){
+  if (targetH-24>=0 && actual[targetH-24]!=null) return actual[targetH-24];
+  if (targetH-168>=0 && actual[targetH-168]!=null) return actual[targetH-168];
+  const vals = actual.filter(v=>v!=null);
+  return vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : 500;
+}
+function getForecastSeries(ctx, nowH, endH){
+  // returns array of predicted CI for hours nowH..endH inclusive
+  const out = [];
+  if (ctx.mode==="demo"){
+    for (let h=nowH; h<=endH; h++) out.push(h<ctx.forecast.length ? ctx.forecast[h] : seasonalNaive(ctx.actual,h));
+    return out;
+  }
+  const model = ctx.driving ? upload.models[ctx.driving] : null;
+  for (let h=nowH; h<=endH; h++){
+    let v=null;
+    if (model){
+      let m = model.byIssue.get(nowH);
+      if (m && m.has(h)) v = m.get(h);
+      if (v===null){
+        for (let back=1; back<=6 && v===null; back++){
+          const mb = model.byIssue.get(nowH-back);
+          if (mb && mb.has(h)) v = mb.get(h);
+        }
+      }
+    }
+    if (v===null) v = seasonalNaive(ctx.actual, h);
+    out.push(v);
+  }
+  return out;
+}
+
+/* ====================================================================
+   Simulation
+==================================================================== */
+function simulate(policyId, jobsIn, ctx, capacity, kOverride){
+  const actual = ctx.actual, horizonLen = actual.length;
+  const k = kOverride!=null ? kOverride : ctx.k;
+  const jobs = jobsIn.map(j=>{
+    const duration = Math.min(j.duration, Math.max(1,k-1));
+    return {...j, duration, hoursLeft:duration, deadline:j.arrival+k, started:false, completed:false, missed:false, runHours:[], finishedAt:null, resumedOnce:false};
+  });
+
+  const sortedF = [...actual].filter(v=>v!=null).sort((a,b)=>a-b);
+  const median = sortedF[Math.floor(sortedF.length/2)] || 500;
+
+  const gpuUsedPerHour = new Array(horizonLen).fill(0);
+  let emAvg_g = 0, emMarg_g = 0, totalDelay = 0, completedCount=0;
+
+  for (let h=0; h<horizonLen; h++){
+    const waiting = jobs.filter(j=> !j.completed && j.arrival<=h && j.deadline>=0);
+    if (waiting.length===0) continue;
+
+    const withSlack = waiting.map(j=>({job:j, slack:(j.deadline-h)-j.hoursLeft}));
+    const mustRun = policyId==="runnow" ? [] : withSlack.filter(x=>x.slack<=0);
+    const mustRunIds = new Set(mustRun.map(x=>x.job.id));
+
+    let wantsRun;
+    if (policyId==="runnow"){
+      wantsRun = withSlack;
+    } else if (policyId==="threshold"){
+      const fc = getForecastSeries(ctx, h, h)[0];
+      wantsRun = withSlack.filter(x=> !mustRunIds.has(x.job.id) && fc < median);
+    } else {
+      wantsRun = withSlack.filter(x=>{
+        if (mustRunIds.has(x.job.id)) return false;
+        const j = x.job;
+        const end = Math.min(horizonLen-1, j.deadline);
+        if (end<h) return false;
+        const series = policyId==="oracle" ? actual.slice(h,end+1) : getForecastSeries(ctx,h,end);
+        const idx = series.map((v,i)=>({t:h+i, v})).sort((a,b)=>a.v-b.v);
+        const best = new Set(idx.slice(0, j.hoursLeft).map(w=>w.t));
+        return best.has(h);
+      });
+    }
+
+    const runCandidates = [
+      ...mustRun.sort((a,b)=>a.slack-b.slack),
+      ...wantsRun.sort((a,b)=> policyId==="runnow" ? a.job.arrival-b.job.arrival : a.slack-b.slack)
+    ];
+
+    let free = capacity;
+    for (const {job} of runCandidates){
+      if (job.completed) continue;
+      if (job.gpus > free) continue;
+      free -= job.gpus;
+      const wasPaused = job.started && job.runHours.length && job.runHours[job.runHours.length-1] !== h-1;
+      job.hoursLeft -= 1;
+      job.started = true;
+      job.runHours.push(h);
+      gpuUsedPerHour[h] += job.gpus;
+      const ci = actual[h]!=null ? actual[h] : median;
+      const mef = ctx.mef[h]!=null ? ctx.mef[h] : ci*1.0;
+      let energyKWh = job.gpus * GPU_POWER_KW * PUE * 1;
+      if (wasPaused) energyKWh += job.gpus * GPU_POWER_KW * PUE * CHECKPOINT_HOURS;
+      emAvg_g += energyKWh * ci;
+      emMarg_g += energyKWh * mef;
+      if (job.hoursLeft<=0){
+        job.completed = true; job.finishedAt = h; completedCount++;
+        if (h > job.deadline) job.missed = true;
+        totalDelay += Math.max(0, (h - job.arrival) - job.duration);
+      }
+    }
+  }
+  jobs.forEach(j=>{ if(!j.completed) j.missed = true; });
+
+  return {
+    policyId, jobs, gpuUsedPerHour,
+    emAvg_kg: emAvg_g/1000, emMarg_kg: emMarg_g/1000,
+    missedCount: jobs.filter(j=>j.missed).length,
+    avgUtil: gpuUsedPerHour.reduce((a,b)=>a+b,0) / (horizonLen*capacity),
+    meanAddedDelay: completedCount ? totalDelay/completedCount : 0
+  };
+}
+
+/* ====================================================================
+   Accuracy (MAE / MAPE / rank)
+==================================================================== */
+function spearman(xs, ys){
+  const n = xs.length; if (n<2) return null;
+  const rank = arr=>{
+    const idx = arr.map((v,i)=>i).sort((a,b)=>arr[a]-arr[b]);
+    const r = new Array(n);
+    idx.forEach((orig,pos)=> r[orig]=pos+1);
+    return r;
+  };
+  const rx = rank(xs), ry = rank(ys);
+  const mx = rx.reduce((a,b)=>a+b,0)/n, my = ry.reduce((a,b)=>a+b,0)/n;
+  let num=0, dx=0, dy=0;
+  for (let i=0;i<n;i++){ num += (rx[i]-mx)*(ry[i]-my); dx += (rx[i]-mx)**2; dy += (ry[i]-my)**2; }
+  if (dx===0||dy===0) return null;
+  return num/Math.sqrt(dx*dy);
+}
+function computeAccuracy(ctx){
+  const rowsOut = [];
+  const addRow = (name, maeV, mapeV, rankV)=> rowsOut.push({name, mae:maeV, mape:mapeV, rank:rankV});
+
+  if (ctx.mode==="demo"){
+    let ae=0, ape=0, n=0;
+    for (let h=0;h<ctx.actual.length;h++){
+      const a = ctx.actual[h], f = ctx.forecast[h];
+      if (a==null) continue;
+      ae += Math.abs(f-a); if (a!==0) ape += Math.abs((f-a)/a); n++;
+    }
+    const windows = [];
+    for (let h=0; h+23<ctx.actual.length; h+=24){
+      const pred = ctx.forecast.slice(h,h+24), act = ctx.actual.slice(h,h+24);
+      const rho = spearman(pred, act); if (rho!=null) windows.push(rho);
+    }
+    addRow("demo forecast", n?ae/n:null, n?ape/n*100:null, windows.length?windows.reduce((a,b)=>a+b,0)/windows.length:null);
+    return rowsOut;
+  }
+
+  Object.keys(upload.models).forEach(name=>{
+    const model = upload.models[name];
+    let ae=0, ape=0, n=0; const windows=[];
+    model.byIssue.forEach((targets, issueH)=>{
+      const pred=[], act=[];
+      targets.forEach((p,th)=>{
+        const idx = th-upload.h0;
+        if (idx>=0 && idx<ctx.actual.length && ctx.actual[idx]!=null){
+          const a = ctx.actual[idx];
+          ae += Math.abs(p-a); if(a!==0) ape += Math.abs((p-a)/a); n++;
+          pred.push(p); act.push(a);
+        }
+      });
+      if (pred.length>=3){ const rho=spearman(pred,act); if (rho!=null) windows.push(rho); }
+    });
+    addRow(name, n?ae/n:null, n?ape/n*100:null, windows.length?windows.reduce((a,b)=>a+b,0)/windows.length:null);
+  });
+  return rowsOut;
+}
+
+/* ====================================================================
+   State + orchestration
+==================================================================== */
+let state = {
+  mode:"demo", region:"east", k:24, capacity:64,
+  actual:[], forecast:[], mef:[], jobsBase:[],
+  results:{}, resultsByK:{}, capCompare:null, accuracy:[],
+  activePolicies: new Set(["runnow","greedy"]),
+  inspect:"greedy", tab:"jobs",
+  playing:false, playTimer:null
+};
+
+function currentCtx(){
+  if (state.mode==="demo") return {mode:"demo", actual:state.actual, forecast:state.forecast, mef:state.mef, k:state.k};
+  return {mode:"upload", actual:upload.actual, forecast:[], mef:upload.mef, driving:upload.driving, k:state.k, h0:upload.h0};
+}
+
+function runAll(){
+  const ctx = currentCtx();
+  if (!ctx.actual || !ctx.actual.length) return;
+  const capacity = state.capacity, k = state.k;
+  const jobs = state.jobsBase;
+
+  state.results = {};
+  POLICIES.forEach(p=>{ state.results[p.id] = simulate(p.id, jobs, ctx, capacity, k); });
+
+  const sweepKs = [6,12,24,48];
+  state.resultsByK = {};
+  sweepKs.forEach(kk=>{
+    state.resultsByK[kk] = {
+      greedy: simulate("greedy", jobs, ctx, capacity, kk),
+      oracle: simulate("oracle", jobs, ctx, capacity, kk),
+      runnow: simulate("runnow", jobs, ctx, capacity, kk)
+    };
+  });
+
+  const unlimited = simulate("greedy", jobs, ctx, 100000, k);
+  const realistic = state.results["greedy"];
+  const baseAvg = state.results["runnow"].emAvg_kg || 0.0001;
+  state.capCompare = {
+    realistic: {savedPct: 1-(realistic.emAvg_kg/baseAvg), cap:capacity},
+    unlimited: {savedPct: 1-(unlimited.emAvg_kg/(simulate("runnow",jobs,ctx,100000,k).emAvg_kg||0.0001)), cap:100000}
+  };
+
+  state.accuracy = computeAccuracy(ctx);
+  renderAll();
+}
+
+function regenDemo(){
+  seed = Date.now() % 2147483647; rng = mulberry32(seed);
+  state.region = document.getElementById("regionSel").value;
+  state.k = parseInt(document.getElementById("delaySel").value,10);
+  state.capacity = parseInt(document.getElementById("gpuSel").value,10);
+  const t = genDemoTimeline(state.region);
+  state.actual=t.actual; state.forecast=t.forecast; state.mef=t.mef;
+  state.jobsBase = genJobsBase(state.capacity);
+  document.getElementById("hourScrub").max = state.actual.length-1;
+  document.getElementById("hourScrub").value = 0;
+  document.getElementById("eyebrowText").textContent = "Demo scenario · synthetic data";
+  runAll();
+}
+function runUploadedScenario(){
+  state.k = parseInt(document.getElementById("delaySel2").value,10);
+  state.capacity = parseInt(document.getElementById("gpuSel2").value,10);
+  if (!state.jobsBase.length || state.mode!=="upload") state.jobsBase = genJobsBase(state.capacity);
+  document.getElementById("hourScrub").max = Math.max(0, upload.actual.length-1);
+  document.getElementById("hourScrub").value = 0;
+  document.getElementById("eyebrowText").textContent = "Uploaded CSVs · real grid data";
+  runAll();
+}
+
+/* ====================================================================
+   Rendering
+==================================================================== */
+let ciChart=null, emChart=null, kChart=null, hodChart=null;
+function fmtPct(x){ return (x*100).toFixed(1)+"%"; }
+function fmtKg(x){ return x.toFixed(1); }
+function cssVar(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function isDark(){
+  const forced = document.documentElement.getAttribute("data-theme");
+  if (forced) return forced==="dark";
+  return matchMedia("(prefers-color-scheme: dark)").matches;
+}
+function activeColor(id){ return isDark() ? policyColorDark(id) : POLICIES.find(p=>p.id===id).color; }
+
+function renderPolicyPicker(){
+  const el = document.getElementById("policyPicker");
+  el.innerHTML = "";
+  POLICIES.forEach(p=>{
+    const on = state.activePolicies.has(p.id);
+    const label = document.createElement("label");
+    label.className = "policy-chip" + (on?"":" off");
+    label.title = p.desc;
+    label.innerHTML = `<input type="checkbox" ${on?"checked":""}><span class="swatch" style="background:${activeColor(p.id)}"></span><span>${p.name}</span>`;
+    label.querySelector("input").addEventListener("change",(e)=>{
+      if (e.target.checked) state.activePolicies.add(p.id); else state.activePolicies.delete(p.id);
+      if (state.activePolicies.size===0){ e.target.checked=true; state.activePolicies.add(p.id); }
+      renderPolicyPicker(); renderKpis(); renderEmChart();
+    });
+    el.appendChild(label);
+  });
+}
+
+function renderKpis(){
+  const el = document.getElementById("kpiGrid");
+  const baseline = state.results["runnow"];
+  el.innerHTML = "";
+  POLICIES.filter(p=>state.activePolicies.has(p.id)).forEach(p=>{
+    const r = state.results[p.id]; if (!r) return;
+    const savedAvg = baseline ? 1-(r.emAvg_kg/Math.max(0.0001,baseline.emAvg_kg)) : 0;
+    const savedMarg = baseline ? 1-(r.emMarg_kg/Math.max(0.0001,baseline.emMarg_kg)) : 0;
+    const card = document.createElement("div");
+    card.className = "kpi-card";
+    card.innerHTML = `
+      <div class="bar" style="background:${activeColor(p.id)}"></div>
+      <div class="kpi-head"><span class="swatch" style="background:${activeColor(p.id)}"></span><span class="name">${p.name}</span></div>
+      <div class="kpi-row"><span class="label">Avg. emissions</span><span class="value tnum">${fmtKg(r.emAvg_kg)} kg</span></div>
+      <div class="kpi-row"><span class="label">Marginal emissions</span><span class="value tnum">${fmtKg(r.emMarg_kg)} kg</span></div>
+      <div class="kpi-subhead">vs run-now baseline</div>
+      <div class="kpi-row"><span class="label">Saved (average)</span><span class="value tnum ${p.id==="runnow"?"":(savedAvg>=0?"good":"crit")}">${p.id==="runnow"?"baseline":(savedAvg>=0?"−":"+")+fmtPct(Math.abs(savedAvg))}</span></div>
+      <div class="kpi-row"><span class="label">Saved (marginal)</span><span class="value tnum ${p.id==="runnow"?"":(savedMarg>=0?"good":"crit")}">${p.id==="runnow"?"baseline":(savedMarg>=0?"−":"+")+fmtPct(Math.abs(savedMarg))}</span></div>
+      <div class="kpi-row"><span class="label">Deadlines missed</span><span class="value tnum ${r.missedCount>0?"crit":"good"}">${r.missedCount} / ${state.jobsBase.length}</span></div>
+      <div class="kpi-row"><span class="label">Mean added delay</span><span class="value tnum">${r.meanAddedDelay.toFixed(1)}h</span></div>
+      <div class="kpi-row"><span class="label">Avg. GPU utilization</span><span class="value tnum">${fmtPct(r.avgUtil)}</span></div>
+    `;
+    el.appendChild(card);
+  });
+}
+
+function renderAccTable(){
+  const t = document.getElementById("accTable");
+  if (!state.accuracy.length){ t.innerHTML = "<tr><td style='padding:10px;color:var(--fg-faint)'>No forecast data yet.</td></tr>"; return; }
+  let html = "<thead><tr><th>Model</th><th>MAE (gCO₂/kWh)</th><th>MAPE</th><th>Rank accuracy (Spearman)</th></tr></thead><tbody>";
+  state.accuracy.forEach(r=>{
+    const isDriving = state.mode==="upload" && r.name===upload.driving;
+    html += `<tr><td class="model">${r.name}${isDriving?'<span class="driving-badge">driving</span>':''}</td>
+      <td>${r.mae!=null?r.mae.toFixed(1):"—"}</td>
+      <td>${r.mape!=null?r.mape.toFixed(1)+"%":"—"}</td>
+      <td>${r.rank!=null?r.rank.toFixed(3):"—"}</td></tr>`;
+  });
+  t.innerHTML = html+"</tbody>";
+}
+
+function renderCiChart(){
+  const ctx0 = document.getElementById("ciChart");
+  const ctx = currentCtx();
+  const labels = ctx.actual.map((_,h)=>h);
+  const fc = ctx.mode==="demo" ? ctx.forecast : labels.map(h=> getForecastSeries(ctx,h,h)[0]);
+  const data = { labels, datasets:[
+    {label:"Actual CI", data:ctx.actual, borderColor:cssVar("--fg"), backgroundColor:"transparent", borderWidth:1.5, pointRadius:0, tension:0.2},
+    {label:"Forecast CI", data:fc, borderColor:cssVar("--accent"), backgroundColor:"transparent", borderWidth:1.5, borderDash:[4,3], pointRadius:0, tension:0.2},
+    {label:"MEF", data:ctx.mef, borderColor:cssVar("--accent2"), backgroundColor:"transparent", borderWidth:1.2, pointRadius:0, tension:0.2}
+  ]};
+  const opts = {
+    responsive:true, maintainAspectRatio:false, animation:false, interaction:{mode:"index",intersect:false},
+    plugins:{legend:{display:true,labels:{color:cssVar("--fg-dim"),boxWidth:12,font:{size:11}}}},
+    scales:{
+      x:{title:{display:true,text:"hour",color:cssVar("--fg-faint"),font:{size:10}},ticks:{color:cssVar("--fg-faint"),font:{size:9},maxTicksLimit:8},grid:{color:cssVar("--border")}},
+      y:{title:{display:true,text:"gCO₂/kWh",color:cssVar("--fg-faint"),font:{size:10}},ticks:{color:cssVar("--fg-faint"),font:{size:9}},grid:{color:cssVar("--border")}}
+    }
+  };
+  if (ciChart) ciChart.destroy();
+  ciChart = new Chart(ctx0, {type:"line", data, options:opts});
+}
+
+function renderEmChart(){
+  const ctx0 = document.getElementById("emChart");
+  const active = POLICIES.filter(p=>state.activePolicies.has(p.id));
+  const data = { labels: active.map(p=>p.name), datasets:[
+    {label:"Average", data:active.map(p=>state.results[p.id]?state.results[p.id].emAvg_kg:0), backgroundColor:active.map(p=>activeColor(p.id)), borderRadius:5, maxBarThickness:36},
+    {label:"Marginal", data:active.map(p=>state.results[p.id]?state.results[p.id].emMarg_kg:0), backgroundColor:active.map(p=>activeColor(p.id)+"88"), borderRadius:5, maxBarThickness:36}
+  ]};
+  const opts = {
+    responsive:true, maintainAspectRatio:false, animation:false,
+    plugins:{legend:{display:true,labels:{color:cssVar("--fg-dim"),boxWidth:12,font:{size:11}}}},
+    scales:{ x:{ticks:{color:cssVar("--fg-dim"),font:{size:11}},grid:{display:false}}, y:{title:{display:true,text:"kg CO₂",color:cssVar("--fg-faint"),font:{size:10}},ticks:{color:cssVar("--fg-faint"),font:{size:9}},grid:{color:cssVar("--border")}} }
+  };
+  if (emChart) emChart.destroy();
+  emChart = new Chart(ctx0, {type:"bar", data, options:opts});
+}
+
+function renderKChart(){
+  const ctx0 = document.getElementById("kChart");
+  const ks = [6,12,24,48];
+  const base = ks.map(k=>state.resultsByK[k].runnow);
+  const mk = (policy, field) => ks.map((k,i)=> 1 - (state.resultsByK[k][policy][field] / Math.max(0.0001, base[i][field])));
+  const data = { labels: ks.map(k=>k+"h"), datasets:[
+    {label:"Forecast-greedy, avg", data:mk("greedy","emAvg_kg").map(v=>v*100), borderColor:activeColor("greedy"), backgroundColor:"transparent", borderWidth:2, pointRadius:3},
+    {label:"Forecast-greedy, marginal", data:mk("greedy","emMarg_kg").map(v=>v*100), borderColor:activeColor("greedy"), backgroundColor:"transparent", borderWidth:2, borderDash:[4,3], pointRadius:3},
+    {label:"Oracle, avg", data:mk("oracle","emAvg_kg").map(v=>v*100), borderColor:activeColor("oracle"), backgroundColor:"transparent", borderWidth:2, pointRadius:3},
+    {label:"Oracle, marginal", data:mk("oracle","emMarg_kg").map(v=>v*100), borderColor:activeColor("oracle"), backgroundColor:"transparent", borderWidth:2, borderDash:[4,3], pointRadius:3}
+  ]};
+  const opts = {
+    responsive:true, maintainAspectRatio:false, animation:false,
+    plugins:{legend:{display:true,labels:{color:cssVar("--fg-dim"),boxWidth:10,font:{size:10}}}},
+    scales:{ x:{title:{display:true,text:"allowed delay k",color:cssVar("--fg-faint"),font:{size:10}},ticks:{color:cssVar("--fg-dim"),font:{size:10}},grid:{color:cssVar("--border")}},
+             y:{title:{display:true,text:"% saved vs run-now",color:cssVar("--fg-faint"),font:{size:10}},ticks:{color:cssVar("--fg-faint"),font:{size:9}},grid:{color:cssVar("--border")}} }
+  };
+  if (kChart) kChart.destroy();
+  kChart = new Chart(ctx0, {type:"line", data, options:opts});
+}
+
+function renderHodChart(){
+  const ctx0 = document.getElementById("hodChart");
+  const ctx = currentCtx();
+  const ciByHod = new Array(24).fill(0), mefByHod = new Array(24).fill(0), cnt = new Array(24).fill(0);
+  ctx.actual.forEach((v,h)=>{ if (v==null) return; const hod=h%24; ciByHod[hod]+=v; mefByHod[hod]+=(ctx.mef[h]!=null?ctx.mef[h]:v); cnt[hod]++; });
+  const ciAvg = ciByHod.map((s,i)=> cnt[i]?s/cnt[i]:0);
+  const mefAvg = mefByHod.map((s,i)=> cnt[i]?s/cnt[i]:0);
+  const data = { labels: Array.from({length:24},(_,i)=>i), datasets:[
+    {label:"Avg CI", data:ciAvg, borderColor:cssVar("--fg"), backgroundColor:"transparent", borderWidth:2, pointRadius:0, tension:0.3},
+    {label:"MEF", data:mefAvg, borderColor:cssVar("--accent2"), backgroundColor:"transparent", borderWidth:2, pointRadius:0, tension:0.3}
+  ]};
+  const opts = {
+    responsive:true, maintainAspectRatio:false, animation:false,
+    plugins:{legend:{display:true,labels:{color:cssVar("--fg-dim"),boxWidth:12,font:{size:11}}}},
+    scales:{ x:{title:{display:true,text:"hour of day",color:cssVar("--fg-faint"),font:{size:10}},ticks:{color:cssVar("--fg-faint"),font:{size:9}},grid:{color:cssVar("--border")}},
+             y:{title:{display:true,text:"gCO₂/kWh",color:cssVar("--fg-faint"),font:{size:10}},ticks:{color:cssVar("--fg-faint"),font:{size:9}},grid:{color:cssVar("--border")}} }
+  };
+  if (hodChart) hodChart.destroy();
+  hodChart = new Chart(ctx0, {type:"line", data, options:opts});
+}
+
+function renderCapCompare(){
+  const el = document.getElementById("capCompare");
+  if (!state.capCompare){ el.innerHTML=""; return; }
+  const {realistic, unlimited} = state.capCompare;
+  el.innerHTML = `
+    <div class="cap-tile"><div class="stat-label">Realistic (${realistic.cap} GPUs)</div><div class="big-stat tnum">${(realistic.savedPct*100).toFixed(1)}<span class="unit">% saved</span></div></div>
+    <div class="cap-tile"><div class="stat-label">Unlimited capacity</div><div class="big-stat tnum">${(unlimited.savedPct*100).toFixed(1)}<span class="unit">% saved</span></div></div>
+    <div class="cap-tile"><div class="stat-label">Lost to capacity limits</div><div class="big-stat tnum">${Math.max(0,(unlimited.savedPct-realistic.savedPct)*100).toFixed(1)}<span class="unit">pts</span></div></div>
+  `;
+}
+
+function renderInspectSelectors(){
+  [document.getElementById("inspectSel"), document.getElementById("inspectSel2")].forEach(sel=>{
+    sel.innerHTML = POLICIES.map(p=>`<option value="${p.id}" ${p.id===state.inspect?"selected":""}>${p.name}</option>`).join("");
+    sel.onchange = (e)=>{ state.inspect = e.target.value; syncInspectSelectors(); renderJobTimeline(); renderMap(); };
+  });
+}
+function syncInspectSelectors(){
+  document.getElementById("inspectSel").value = state.inspect;
+  document.getElementById("inspectSel2").value = state.inspect;
+}
+
+function renderJobTimeline(){
+  const r = state.results[state.inspect]; if (!r) return;
+  const horizon = currentCtx().actual.length;
+  const table = document.getElementById("jtTable");
+  const jobs = r.jobs;
+  let thead = "<thead><tr><th class=\"jt-rowlabel\">Job</th>";
+  for (let h=0; h<horizon; h++){ const major=h%12===0; thead += `<th class="jt-hourhead${major?" major":""}">${major?("h"+h):""}</th>`; }
+  thead += "</tr></thead>";
+  let rows = "<tbody>";
+  jobs.forEach(j=>{
+    rows += `<tr class="jt-row"><td class="jt-rowlabel"><div class="jid">${j.id}</div><div class="meta">${j.gpus} GPU &middot; ${j.duration}h &middot; arr h${j.arrival}</div></td>`;
+    const runSet = new Set(j.runHours);
+    for (let h=0; h<horizon; h++){
+      let cls = "idle";
+      if (h >= j.arrival && h <= (j.finishedAt ?? horizon-1)){
+        cls = runSet.has(h) ? "run" : "wait";
+      }
+      if (j.missed && h===Math.min(horizon-1,j.deadline)) cls = runSet.has(h) ? "run" : "missed";
+      const isDeadline = h===j.deadline ? " deadline" : "";
+      rows += `<td class="jt-cell ${cls}${isDeadline}" title="${j.id} h${h}: ${cls}"></td>`;
+    }
+    rows += "</tr>";
+  });
+  rows += "</tbody>";
+  table.innerHTML = thead+rows;
+}
+
+function ciToClass(actual, v){
+  const sorted = [...actual].filter(x=>x!=null).sort((a,b)=>a-b);
+  const lo = sorted[Math.floor(sorted.length*0.33)], hi = sorted[Math.floor(sorted.length*0.66)];
+  if (v<=lo) return ""; if (v<=hi) return "mid"; return "dirty";
+}
+function buildRackFloor(){
+  const floor = document.getElementById("rackFloor");
+  floor.innerHTML = "";
+  const racks = 8;
+  const perRack = Math.max(4, Math.ceil(state.capacity/racks));
+  for (let r=0;r<racks;r++){
+    const rack = document.createElement("div"); rack.className="rack";
+    const grid = document.createElement("div"); grid.className="rack-grid";
+    for (let g=0; g<perRack; g++){ const tile=document.createElement("div"); tile.className="gpu"; grid.appendChild(tile); }
+    rack.appendChild(grid); floor.appendChild(rack);
+  }
+}
+function renderMap(){
+  const ctx = currentCtx();
+  const scrub = document.getElementById("hourScrub");
+  const h = Math.min(parseInt(scrub.value,10)||0, ctx.actual.length-1);
+  document.getElementById("clockLabel").textContent = "h"+String(h).padStart(2,"0");
+  const ci = ctx.actual[h], mef = ctx.mef[h];
+  document.getElementById("mapCiValue").innerHTML = (ci!=null?Math.round(ci):"—")+'<span class="unit">gCO₂/kWh</span>';
+  document.getElementById("mapMefValue").innerHTML = (mef!=null?Math.round(mef):"—")+'<span class="unit">gCO₂/kWh</span>';
+  const sorted = [...ctx.actual].filter(v=>v!=null).sort((a,b)=>a-b);
+  const min=sorted[0], max=sorted[sorted.length-1];
+  const pct = max>min ? Math.max(0,Math.min(100, ((ci-min)/(max-min))*100)) : 50;
+  document.getElementById("ciKnob").style.left = pct+"%";
+
+  const r = state.results[state.inspect]; if (!r) return;
+  const used = r.gpuUsedPerHour[h]||0;
+  document.getElementById("mapUtilValue").innerHTML = Math.round((used/state.capacity)*100)+'<span class="unit">%</span>';
+  const ciClass = ciToClass(ctx.actual, ci);
+  document.querySelectorAll("#rackFloor .gpu").forEach((t,i)=>{ const busy=i<used; t.className="gpu"+(busy?" busy "+ciClass:""); });
+
+  const waiting = r.jobs.filter(j=> j.arrival<=h && !j.completed);
+  const q = document.getElementById("queueList");
+  q.innerHTML = waiting.length===0 ? '<div class="queue-item" style="color:var(--fg-faint)">queue empty</div>' :
+    waiting.slice(0,12).map(j=>{ const slack=(j.deadline-h)-j.hoursLeft; return `<div class="queue-item ${slack<=0?"must":""}"><span class="jid">${j.id}</span><span>${j.gpus} GPU &middot; slack ${slack}h</span></div>`; }).join("");
+}
+function playTick(){
+  const scrub = document.getElementById("hourScrub");
+  const max = parseInt(scrub.max,10);
+  let v = parseInt(scrub.value,10)+1; if (v>max) v=0;
+  scrub.value = v; renderMap();
+}
+
+function setTab(tab){
+  state.tab = tab;
+  document.getElementById("tabJobs").hidden = tab!=="jobs";
+  document.getElementById("tabMap").hidden = tab!=="map";
+  document.getElementById("tabBtnJobs").setAttribute("aria-selected", tab==="jobs");
+  document.getElementById("tabBtnMap").setAttribute("aria-selected", tab==="map");
+  if (tab==="map") renderMap();
+}
+
+function renderAll(){
+  renderAccTable();
+  renderPolicyPicker();
+  renderKpis();
+  renderCiChart();
+  renderEmChart();
+  renderKChart();
+  renderHodChart();
+  renderCapCompare();
+  renderInspectSelectors();
+  syncInspectSelectors();
+  renderJobTimeline();
+  buildRackFloor();
+  renderMap();
+}
+
+/* ====================================================================
+   Wire up
+==================================================================== */
+document.getElementById("regenBtn").addEventListener("click", regenDemo);
+document.getElementById("regionSel").addEventListener("change", regenDemo);
+document.getElementById("delaySel").addEventListener("change", regenDemo);
+document.getElementById("gpuSel").addEventListener("change", regenDemo);
+document.getElementById("delaySel2").addEventListener("change", runUploadedScenario);
+document.getElementById("gpuSel2").addEventListener("change", runUploadedScenario);
+document.getElementById("truthFile").addEventListener("change", e=>{ if (e.target.files[0]) loadTruthFile(e.target.files[0]); });
+document.getElementById("fcFiles").addEventListener("change", e=>{ if (e.target.files.length) loadForecastFiles(e.target.files); });
+document.getElementById("summaryFile").addEventListener("change", e=>{
+  if (e.target.files[0]) loadSummaryFile(e.target.files[0]);
+});
+
+document.getElementById("modeDemoBtn").addEventListener("click", ()=>{
+  state.mode="demo";
+  document.getElementById("modeDemoBtn").setAttribute("aria-pressed","true");
+  document.getElementById("modeUploadBtn").setAttribute("aria-pressed","false");
+  document.getElementById("demoControls").hidden=false;
+  document.getElementById("uploadControls").hidden=true;
+  regenDemo();
+});
+document.getElementById("modeUploadBtn").addEventListener("click", ()=>{
+  state.mode="upload";
+  document.getElementById("modeDemoBtn").setAttribute("aria-pressed","false");
+  document.getElementById("modeUploadBtn").setAttribute("aria-pressed","true");
+  document.getElementById("demoControls").hidden=true;
+  document.getElementById("uploadControls").hidden=false;
+  document.getElementById("eyebrowText").textContent = "Uploaded CSVs · waiting for files";
+  if (upload.truthLoaded) runUploadedScenario();
+});
+
+document.getElementById("tabBtnJobs").addEventListener("click", ()=>setTab("jobs"));
+document.getElementById("tabBtnMap").addEventListener("click", ()=>setTab("map"));
+document.getElementById("hourScrub").addEventListener("input", renderMap);
+document.getElementById("playBtn").addEventListener("click", ()=>{
+  state.playing = !state.playing;
+  const icon = document.getElementById("playIcon");
+  if (state.playing){ icon.setAttribute("d","M6 5h4v14H6zM14 5h4v14h-4z"); state.playTimer=setInterval(playTick,450); }
+  else { icon.setAttribute("d","M8 5v14l11-7z"); clearInterval(state.playTimer); }
+});
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", ()=>{ renderPolicyPicker(); renderKpis(); renderCiChart(); renderEmChart(); renderKChart(); renderHodChart(); });
+
+regenDemo();
+
+window.claude?.hot?.ready ? window.claude.hot.ready(()=>{}) : null;
+})();
+</script>
+
+</body></html>
