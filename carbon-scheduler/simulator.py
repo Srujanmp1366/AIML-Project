@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 import warnings
 
 import numpy as np
@@ -120,6 +120,8 @@ def _job_rows(jobs: pd.DataFrame, k: int) -> list[_JobRecord]:
                        "started": False, "previous_running": False, "finished": False,
                        "start_time": None, "finish_time": None, "delay_hours": None,
                        "deadline_missed": False, "busy_gpu_hours": 0.0})
+
+        
     return result
 
 
