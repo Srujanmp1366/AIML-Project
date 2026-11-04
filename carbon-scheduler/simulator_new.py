@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import TypedDict
 import warnings
 
 import numpy as np
@@ -31,6 +31,7 @@ class _JobRecord(TypedDict):
     order: int
     started: bool
     previous_running: bool
+    finished: bool
     start_time: pd.Timestamp | None
     finish_time: pd.Timestamp | None
     delay_hours: float | None
@@ -114,17 +115,11 @@ def _job_rows(jobs: pd.DataFrame, k: int) -> list[_JobRecord]:
         if duration <= 0 or gpu_count <= 0: raise ValueError("job durations and GPU counts must be positive")
         deadline = arrival + pd.Timedelta(hours=k) if deferrable else arrival
         result.append({"job": Job(str(row["job_id"]), gpu_count, duration, deadline, deferrable),
-                       "duration": duration, "arrival": arrival,
+                       "duration": duration, "arrival": arrival, "join": arrival,
                        "order": int(row["_order"]),
-<<<<<<< HEAD
                        "started": False, "previous_running": False, "finished": False,
-                       "start_time": pd.NaT,
-                       "finish_time": pd.NaT, "delay_hours": float("nan"), "deadline_missed": False,
-=======
-                       "started": False, "previous_running": False, "start_time": None,
-                       "finish_time": None, "delay_hours": None, "deadline_missed": False,
->>>>>>> 6982c2d18a029c33cd802efef988ee4ab240816b
-                       "busy_gpu_hours": 0.0})
+                       "start_time": None, "finish_time": None, "delay_hours": None,
+                       "deadline_missed": False, "busy_gpu_hours": 0.0})
     return result
 
 
@@ -171,20 +166,15 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
     total_kwh = avg_kg = marg_kg = busy_gpu_hours = 0.0
     max_hourly_gpus = 0
 
-<<<<<<< HEAD
     now = hours[0]
     next_arrival_index = 0
-    active_records: list[dict[str, object]] = []
+    active_records: list[_JobRecord] = []
     while now < period_end:
         while (next_arrival_index < len(records)
                and records[next_arrival_index]["arrival"] <= now):
             active_records.append(records[next_arrival_index])
             next_arrival_index += 1
         active = active_records
-=======
-    for now in hours:
-        active = [record for record in records if record["join"] <= now and record["finish_time"] is None]
->>>>>>> 6982c2d18a029c33cd802efef988ee4ab240816b
         inference = sorted((r for r in active if not r["job"].deferrable), key=lambda r: (r["arrival"], r["order"]))
         inference_ids: list[str] = []
         remaining = capacity
@@ -195,7 +185,6 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
                 if remaining is not None:
                     remaining -= job.gpus
         free = remaining
-<<<<<<< HEAD
         hour = now.floor("h")
         if hour not in forecast_cache:
             targets = pd.date_range(hour, periods=24, freq="h")
@@ -215,16 +204,12 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
             else:
                 raise ValueError("source must be 'forecast' or 'actual'")
         forecast = forecast_cache[hour]
-        training = [record["job"] for record in active if record["job"].deferrable]
-=======
-        forecast = _forecast_at(now, forecasts, truth, source)
         training: list[Job] = []
         for record in active:
             if record["job"].deferrable:
                 record["job"].has_started = record["started"]
                 record["job"].ran_last_hour = record["previous_running"]
                 training.append(record["job"])
->>>>>>> 6982c2d18a029c33cd802efef988ee4ab240816b
         training_ids = policy(now, training, forecast, free)
         training_map = {job.job_id: job for job in training}
         if len(training_ids) != len(set(training_ids)) or any(j not in training_map for j in training_ids):
@@ -235,15 +220,9 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
         selected_ids = set(inference_ids + training_ids)
         scheduled_gpus = sum(r["job"].gpus for r in active if r["job"].job_id in selected_ids)
         max_hourly_gpus = max(max_hourly_gpus, scheduled_gpus)
-<<<<<<< HEAD
         actual_ci = float(actual_ci_by_hour[hour])
         mef_value = mef_by_hour[hour]
         mef = float(mef_value) if pd.notna(mef_value) else float("nan")
-=======
-        actual_ci = float(cast(float, truth_values.at[now, "actual_ci"]))
-        mef_value = truth_values.at[now, "mef"]
-        mef = float(cast(float, mef_value)) if pd.notna(mef_value) else float("nan")
->>>>>>> 6982c2d18a029c33cd802efef988ee4ab240816b
 
         next_event = min(period_end, hour + HOUR)
         if next_arrival_index < len(records):
