@@ -70,11 +70,18 @@ def _sweep(forecast_path: Path, figures: bool) -> None:
     per_job_dir = results_dir / "per_job"
     per_job_dir.mkdir(parents=True, exist_ok=True)
     summaries: list[dict[str, object]] = []
+    total_runs = len(POLICIES) * len(K_VALUES) * len(CAPACITIES)
+    run_number = 0
     for policy in POLICIES:
         for k in K_VALUES:
             for capacity in CAPACITIES:
-                metrics, per_job = run_sim(policy, k, capacity, jobs, truth, forecasts)
+                run_number += 1
                 gpu_label = "unlimited" if capacity is None else str(capacity)
+                print(
+                    f"[{run_number}/{total_runs}] policy={policy}, k={k}, GPUs={gpu_label}",
+                    flush=True,
+                )
+                metrics, per_job = run_sim(policy, k, capacity, jobs, truth, forecasts)
                 summaries.append({
                     "policy": policy,
                     "k": k,
