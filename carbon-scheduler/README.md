@@ -12,6 +12,8 @@ Put these files in `data/`:
 - `grid_truth.csv`: `time`, `actual_ci`, `mef`
 - `forecasts_<model>.csv`: `issue_time`, `target_time`, `predicted_ci`
 
+For multi-grid runs, add a `zone` column to **both** grid truth and forecast CSVs. The same zone value must identify the same grid in both files. Each zone must have a complete actual carbon-intensity trace matching its forecasts. The simulator runs each zone independently and writes a combined `results/summary.csv` with a `zone` column, plus per-zone summaries and per-job files under `results/zones/<zone>/`. If `jobs.csv` has no `zone` column, the same workload is simulated for every zone; if it does have one, each zone uses only its matching jobs.
+
 Grid and forecast timestamps must identify UTC hours; job arrival timestamps may be at any UTC time. Each forecast issue time needs exactly 24 target rows, from the first target hour through the following 23 hours. `actual_ci` and `predicted_ci` are in gCO₂/kWh; MEF uses the same units. Leave `mef` empty when marginal intensity is unavailable. In that case the simulator warns and reports marginal scores as missing.
 
 The simulator treats `deferrable` values `true`, `1`, and `yes` as true (case insensitive). GPU demand is rounded up to a whole GPU.
@@ -24,12 +26,24 @@ From this directory, use an environment with the dependencies above, then:
 python run.py naive
 python run.py sweep --forecast data/forecasts_naive24.csv
 python run.py sweep --forecast data/forecasts_naive24.csv --figures
+python run.py sweep --forecast data/forecasts_lightgbm_all_zones.csv --truth data/grid_truth_all_zones.csv
 pytest
 ```
 
-`naive` writes `data/forecasts_naive24.csv`, using the actual CI from 24 hours before each target hour. `sweep` runs `run_now`, `threshold`, `forecast_greedy`, and `oracle` for `k = 6, 12, 24, 48` and capacities of 64, 32, 128, and unlimited GPUs. It writes `results/summary.csv` and one CSV per run under `results/per_job/`. `--figures` also writes `results/co2_saved_vs_k.png` and `results/capacity_savings.png`.
+`naive` writes `data/forecasts_naive24.csv`, using the actual CI from 24 hours before each target hour. `sweep` runs `run_now`, `threshold`, `forecast_greedy`, and `oracle` for `k = 6, 12, 24, 48` and capacities of 64, 32, 128, and unlimited GPUs. It writes `results/summary.csv` and one CSV per run under `results/per_job/`. For multi-zone inputs, pass the matching actual trace with `--truth`; results are also written separately under `results/zones/<zone>/`. `--figures` also writes comparison plots.
 
 The test period defaults to the hourly starts represented by the forecast file. The `run_sim` API also accepts an optional UTC `start` and exclusive `end` timestamp.
+
+## Dashboard
+
+Install the project and dashboard dependencies, then run the dashboard from this directory:
+
+```bash
+python -m pip install -r requirements.txt
+streamlit run app.py
+```
+
+The dashboard loads `results/summary.csv` by default. Generate it first with the sweep command above if it is missing. You can also upload a compatible summary CSV. Use the sidebar to select a policy, deferral window, GPU capacity, and average or marginal emissions; the dashboard shows headline metrics, policy comparisons, savings trends, and deadline trade-offs. Assumptions and limitations are explained in the dashboard and below.
 
 ## Model assumptions
 
