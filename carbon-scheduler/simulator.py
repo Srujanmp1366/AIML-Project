@@ -121,7 +121,7 @@ def _job_rows(jobs: pd.DataFrame, k: int) -> list[_JobRecord]:
                        "start_time": None, "finish_time": None, "delay_hours": None,
                        "deadline_missed": False, "busy_gpu_hours": 0.0})
 
-        
+
     return result
 
 
