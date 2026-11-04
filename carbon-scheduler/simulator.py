@@ -51,7 +51,7 @@ def _forecast_at(now: pd.Timestamp, forecasts: pd.DataFrame, truth: pd.DataFrame
     cutoff = now - ISSUE_LAG_HOURS * HOUR
     rows = forecasts.loc[forecasts["issue_time"] == cutoff].sort_values("target_time")
     assert len(rows) == 24, f"expected 24 forecast rows issued at {cutoff}"
-    assert rows["target_time"].reset_index(drop=True).equals(pd.Series(targets)), f"wrong forecast targets at {cutoff}"
+    assert pd.DatetimeIndex(rows["target_time"]).equals(targets), f"wrong forecast targets at {cutoff}"
     assert (rows["issue_time"] <= cutoff).all(), "forecast leakage detected"
     values = rows["predicted_ci"].to_numpy(dtype=float)
     assert np.isfinite(values).all(), "forecast contains missing or non-finite values"
@@ -98,7 +98,7 @@ def _job_rows(jobs: pd.DataFrame, k: int) -> list[dict[str, object]]:
         if duration <= 0 or gpu_count <= 0: raise ValueError("job durations and GPU counts must be positive")
         deadline = arrival + pd.Timedelta(hours=k) if deferrable else pd.NaT
         result.append({"job": Job(str(row["job_id"]), gpu_count, duration, deadline, deferrable),
-                       "duration": duration, "arrival": arrival, "join": arrival.ceil("h"),
+                       "duration": duration, "arrival": arrival,
                        "order": int(row["_order"]),
                        "started": False, "previous_running": False, "start_time": pd.NaT,
                        "finish_time": pd.NaT, "delay_hours": float("nan"), "deadline_missed": False,
@@ -142,8 +142,10 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
     total_kwh = avg_kg = marg_kg = busy_gpu_hours = 0.0
     max_hourly_gpus = 0
 
-    for now in hours:
-        active = [record for record in records if record["join"] <= now and pd.isna(record["finish_time"])]
+    now = hours[0]
+    while now < period_end:
+        active = [record for record in records
+                  if record["arrival"] <= now and pd.isna(record["finish_time"])]
         inference = sorted((r for r in active if not r["job"].deferrable), key=lambda r: (r["arrival"], r["order"]))
         inference_ids: list[str] = []
         remaining = capacity
@@ -154,7 +156,8 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
                 if remaining is not None:
                     remaining -= job.gpus
         free = remaining
-        forecast = _forecast_at(now, forecasts, truth, source)
+        hour = now.floor("h")
+        forecast = _forecast_at(hour, forecasts, truth, source)
         training = [record["job"] for record in active if record["job"].deferrable]
         training_ids = policy(now, training, forecast, free)
         training_map = {job.job_id: job for job in training}
@@ -166,9 +169,22 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
         selected_ids = set(inference_ids + training_ids)
         scheduled_gpus = sum(r["job"].gpus for r in active if r["job"].job_id in selected_ids)
         max_hourly_gpus = max(max_hourly_gpus, scheduled_gpus)
-        actual_ci = float(truth_values.at[now, "actual_ci"])
-        mef = float(truth_values.at[now, "mef"]) if pd.notna(truth_values.at[now, "mef"]) else float("nan")
+        actual_ci = float(truth_values.at[hour, "actual_ci"])
+        mef = float(truth_values.at[hour, "mef"]) if pd.notna(truth_values.at[hour, "mef"]) else float("nan")
 
+        next_event = min(period_end, hour + HOUR)
+        future_arrivals = [record["arrival"] for record in records if record["arrival"] > now]
+        if future_arrivals:
+            next_event = min(next_event, min(future_arrivals))
+        for record in active:
+            job = record["job"]
+            if job.job_id in selected_ids:
+                finish = now + pd.Timedelta(hours=job.hours_left)
+                next_event = min(next_event, finish)
+
+        if next_event <= now:
+            raise RuntimeError("simulation event queue did not advance")
+        segment_hours = (next_event - now).total_seconds() / 3600.0
         for record in active:
             job = record["job"]
             if job.job_id not in selected_ids:
@@ -177,7 +193,7 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
             if pd.isna(record["start_time"]):
                 record["start_time"] = now
             resume = RESUME_MIN / 60.0 if record["started"] and not record["previous_running"] else 0.0
-            run_hours = min(1.0, job.hours_left)
+            run_hours = min(segment_hours, job.hours_left)
             job.hours_left = max(0.0, job.hours_left - run_hours)
             energy = job.gpus * KW_PER_GPU * PUE * (run_hours + resume)
             total_kwh += energy
@@ -189,13 +205,14 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
             record["started"] = True
             record["previous_running"] = True
             if job.hours_left <= 1e-9:
-                finish = now + pd.Timedelta(hours=run_hours)
-                record["finish_time"] = finish
+                finish_time = now + pd.Timedelta(hours=run_hours)
+                record["finish_time"] = finish_time
                 record["delay_hours"] = (
-                    finish - (record["arrival"] + pd.Timedelta(hours=record["duration"]))
+                    finish_time - (record["arrival"] + pd.Timedelta(hours=record["duration"]))
                 ).total_seconds() / 3600.0
-                record["deadline_missed"] = bool(job.deferrable and finish > job.deadline)
+                record["deadline_missed"] = bool(job.deferrable and finish_time > job.deadline)
                 record["previous_running"] = False
+        now = next_event
 
     deferrals = [record for record in records if record["job"].deferrable]
     delays = [record["delay_hours"] for record in records if pd.notna(record["finish_time"])]

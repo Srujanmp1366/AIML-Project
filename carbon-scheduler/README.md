@@ -12,7 +12,7 @@ Put these files in `data/`:
 - `grid_truth.csv`: `time`, `actual_ci`, `mef`
 - `forecasts_<model>.csv`: `issue_time`, `target_time`, `predicted_ci`
 
-Timestamps must identify UTC hours. Each forecast issue time needs exactly 24 target rows, from the first target hour through the following 23 hours. `actual_ci` and `predicted_ci` are in gCO₂/kWh; MEF uses the same units. Leave `mef` empty when marginal intensity is unavailable. In that case the simulator warns and reports marginal scores as missing.
+Grid and forecast timestamps must identify UTC hours; job arrival timestamps may be at any UTC time. Each forecast issue time needs exactly 24 target rows, from the first target hour through the following 23 hours. `actual_ci` and `predicted_ci` are in gCO₂/kWh; MEF uses the same units. Leave `mef` empty when marginal intensity is unavailable. In that case the simulator warns and reports marginal scores as missing.
 
 The simulator treats `deferrable` values `true`, `1`, and `yes` as true (case insensitive). GPU demand is rounded up to a whole GPU.
 
@@ -33,8 +33,8 @@ The test period defaults to the hourly starts represented by the forecast file. 
 
 ## Model assumptions
 
-- Scheduling decisions happen at hour boundaries. A job joins the queue at the first hour boundary at or after its arrival; its deferrable deadline remains exact arrival plus `k` hours.
-- Inference jobs get capacity first in arrival order. Jobs that finish during an hour use GPUs only for their partial work time; those GPUs remain idle until the next hourly decision.
+- Scheduling decisions happen at job arrivals, job completions, and hour boundaries. Arriving jobs are eligible immediately. At each event, running jobs may be preempted and the policy chooses the jobs to run again; inference jobs get capacity first in arrival order.
+- Carbon intensity and MEF are constant within each hour: energy used between 10:00 and 11:00 is scored with the 10:00 values. Jobs may start or finish mid-hour, and energy/utilisation account for partial-hour work.
 - A resumed job adds five minutes of GPU energy use, with no added wall time. That overhead affects kWh and emissions, but not GPU utilisation.
 - Energy is `GPU count × 0.4 kW × 1.5 PUE × (run hours + resume overhead)`. The 0.4 kW figure is anchored to the NVIDIA A100 SXM maximum power specification; it is a modeling reference, not a measurement of a particular workload. The PUE of 1.5 is a rounded scenario value near Uptime Institute's reported 2026 industry average PUE of 1.52. See the [NVIDIA A100 datasheet](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet.pdf) and [Uptime Institute's 2026 PUE survey update](https://intelligence.uptimeinstitute.com/resource/growing-pue-advantage-larger-data-centers).
 - Average and marginal emissions are always scored with actual CI/MEF for the hour energy was used. Missing MEF disables marginal scoring. A trailing 30-day median for `threshold` uses actual CI strictly before the current hour.
@@ -45,6 +45,6 @@ The test period defaults to the hourly starts represented by the forecast file. 
 
 - The simulator needs complete hourly truth and a complete 24-hour forecast at each simulated decision time; it does not fill gaps or infer timezone semantics from local time.
 - There is no idle GPU power, CPU, memory, networking, checkpoint storage, startup cost, or grid-side response model.
-- Jobs cannot be backfilled after a mid-hour finish, and the fixed resume cost does not vary by model or checkpoint state.
+- The fixed resume cost does not vary by model or checkpoint state.
 - Forecast uncertainty and MEF regression error are outside the simulator; the oracle uses a heuristic policy and is not a mathematical optimum.
 - Mean added delay is averaged over jobs that finish in the test period. Unfinished deferrable jobs count as deadline misses.

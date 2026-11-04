@@ -61,7 +61,7 @@ def make_threshold(trailing_median: float | pd.Series) -> Decision:
         free_gpus: int | None,
     ) -> list[str]:
         if isinstance(trailing_median, pd.Series):
-            median = trailing_median.get(now, float("nan"))
+            median = trailing_median.get(now.floor("h"), float("nan"))
         else:
             median = trailing_median
         must_run = [job for job in waiting_jobs if not job.deferrable or slack(job, now) <= 0]
@@ -75,7 +75,11 @@ def make_threshold(trailing_median: float | pd.Series) -> Decision:
 def _wants_to_run(job: Job, now: pd.Timestamp, forecast: np.ndarray) -> bool:
     if slack(job, now) <= 0:
         return True
-    hours_to_deadline = max(0, math.floor((job.deadline - now).total_seconds() / 3600.0))
+    current_hour = now.floor("h")
+    hours_to_deadline = max(
+        0,
+        math.ceil((job.deadline - current_hour).total_seconds() / 3600.0),
+    )
     horizon = min(24, hours_to_deadline)
     if job.hours_left >= horizon:
         return True
