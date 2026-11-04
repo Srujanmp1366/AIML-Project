@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pandas as pd
@@ -13,6 +14,31 @@ from simulator import DATA_DIR, K_VALUES, make_naive_forecast, run_sim
 BASE_DIR = Path(__file__).resolve().parent
 POLICIES = ("run_now", "threshold", "forecast_greedy", "oracle")
 CAPACITIES: tuple[int | None, ...] = (64, 32, 128, None)
+
+
+def iter_runs(
+    jobs: pd.DataFrame,
+    truth: pd.DataFrame,
+    forecasts: pd.DataFrame,
+    policies: Sequence[str] = POLICIES,
+    k_values: Sequence[int] = K_VALUES,
+    capacities: Sequence[int | None] = CAPACITIES,
+    forecast_error_margin_ci: float = 0.0,
+) -> Iterator[tuple[dict[str, object], pd.DataFrame]]:
+    """Yield in-memory sweep results for the CLI and web interface."""
+    for policy in policies:
+        for k in k_values:
+            for capacity in capacities:
+                metrics, per_job = run_sim(
+                    policy, k, capacity, jobs, truth, forecasts,
+                    forecast_error_margin_ci=forecast_error_margin_ci,
+                )
+                yield {
+                    "policy": policy,
+                    "k": k,
+                    "gpus": "unlimited" if capacity is None else str(capacity),
+                    **metrics,
+                }, per_job
 
 
 def _input_path(value: str) -> Path:
@@ -72,23 +98,18 @@ def _sweep(forecast_path: Path, figures: bool) -> None:
     summaries: list[dict[str, object]] = []
     total_runs = len(POLICIES) * len(K_VALUES) * len(CAPACITIES)
     run_number = 0
-    for policy in POLICIES:
-        for k in K_VALUES:
-            for capacity in CAPACITIES:
-                run_number += 1
-                gpu_label = "unlimited" if capacity is None else str(capacity)
-                print(
-                    f"[{run_number}/{total_runs}] policy={policy}, k={k}, GPUs={gpu_label}",
-                    flush=True,
-                )
-                metrics, per_job = run_sim(policy, k, capacity, jobs, truth, forecasts)
-                summaries.append({
-                    "policy": policy,
-                    "k": k,
-                    "gpus": gpu_label,
-                    **metrics,
-                })
-                per_job.to_csv(per_job_dir / f"{policy}_k{k}_g{gpu_label}.csv", index=False)
+    for summary, per_job in iter_runs(jobs, truth, forecasts):
+        run_number += 1
+        print(
+            f"[{run_number}/{total_runs}] policy={summary['policy']}, "
+            f"k={summary['k']}, GPUs={summary['gpus']}",
+            flush=True,
+        )
+        summaries.append(summary)
+        per_job.to_csv(
+            per_job_dir / f"{summary['policy']}_k{summary['k']}_g{summary['gpus']}.csv",
+            index=False,
+        )
     summary = pd.DataFrame(summaries)
     results_dir.mkdir(parents=True, exist_ok=True)
     summary.to_csv(results_dir / "summary.csv", index=False)

@@ -4,6 +4,39 @@ This small Python codebase compares hourly scheduling policies for ML jobs again
 
 Requires Python 3.10+, pandas, numpy, and matplotlib. Install pytest to run the inline-fixture test suite.
 
+## React interface
+
+The frontend lives in `frontend/`. It calls the local Python API in `api.py`, which uses
+`simulator.run_sim` for a single scenario and `run.iter_runs` for policy comparisons.
+The interface shows emissions, completion and delay metrics, and per-job outcomes.
+Web requests keep uploaded data and results in memory; they do not write CSV files.
+
+If you do not already have `.venv`, create it with `python -m venv .venv`.
+From `carbon-scheduler`, start the API in one PowerShell terminal:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+pip install numpy pandas
+python api.py
+```
+
+In a second terminal:
+
+```powershell
+cd frontend
+npm.cmd install
+npm.cmd run dev
+```
+
+Open the URL Vite prints (normally `http://127.0.0.1:5173`). The API runs at
+`http://127.0.0.1:8000`; Vite forwards `/api` requests to it. The interface can read
+`data/jobs.csv`, `data/grid_truth.csv`, and a forecast CSV in `data/`, or you can
+upload all three CSV files in the browser. Uploaded files are not saved to disk.
+
+For a single-server build, run `npm run build` from `frontend/`, then run
+`python api.py` from `carbon-scheduler/` and open `http://127.0.0.1:8000`.
+The CLI commands below remain available separately and still write output files.
+
 ## Inputs
 
 Put these files in `data/`:
