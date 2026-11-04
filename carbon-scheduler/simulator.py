@@ -100,7 +100,8 @@ def _job_rows(jobs: pd.DataFrame, k: int) -> list[dict[str, object]]:
         result.append({"job": Job(str(row["job_id"]), gpu_count, duration, deadline, deferrable),
                        "duration": duration, "arrival": arrival,
                        "order": int(row["_order"]),
-                       "started": False, "previous_running": False, "start_time": pd.NaT,
+                       "started": False, "previous_running": False, "finished": False,
+                       "start_time": pd.NaT,
                        "finish_time": pd.NaT, "delay_hours": float("nan"), "deadline_missed": False,
                        "busy_gpu_hours": 0.0})
     return result
@@ -134,6 +135,13 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
     records = [record for record in records if record["arrival"] < period_end]
     capacity = gpus
     truth_values = truth.set_index("time")
+    actual_ci_by_hour = truth_values["actual_ci"].to_dict()
+    mef_by_hour = truth_values["mef"].to_dict()
+    forecast_groups = {
+        issue_time: group.sort_values("target_time").reset_index(drop=True)
+        for issue_time, group in forecasts.groupby("issue_time", sort=False)
+    }
+    forecast_cache: dict[pd.Timestamp, np.ndarray] = {}
     if not pd.DatetimeIndex(hours).isin(truth_values.index).all(): raise ValueError("simulated hours must exist in grid_truth")
     if truth_values["actual_ci"].reindex(hours).isna().any(): raise ValueError("actual_ci is required for every simulated hour")
     available_mef = truth_values["mef"].reindex(hours).notna().all()
@@ -143,9 +151,14 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
     max_hourly_gpus = 0
 
     now = hours[0]
+    next_arrival_index = 0
+    active_records: list[dict[str, object]] = []
     while now < period_end:
-        active = [record for record in records
-                  if record["arrival"] <= now and pd.isna(record["finish_time"])]
+        while (next_arrival_index < len(records)
+               and records[next_arrival_index]["arrival"] <= now):
+            active_records.append(records[next_arrival_index])
+            next_arrival_index += 1
+        active = active_records
         inference = sorted((r for r in active if not r["job"].deferrable), key=lambda r: (r["arrival"], r["order"]))
         inference_ids: list[str] = []
         remaining = capacity
@@ -157,7 +170,24 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
                     remaining -= job.gpus
         free = remaining
         hour = now.floor("h")
-        forecast = _forecast_at(hour, forecasts, truth, source)
+        if hour not in forecast_cache:
+            targets = pd.date_range(hour, periods=24, freq="h")
+            if source == "actual":
+                actual = truth_values["actual_ci"].reindex(targets)
+                assert len(actual) == 24 and actual.notna().all(), "oracle needs 24 actual CI hours"
+                forecast_cache[hour] = actual.to_numpy(dtype=float)
+            elif source == "forecast":
+                cutoff = hour - ISSUE_LAG_HOURS * HOUR
+                rows = forecast_groups.get(cutoff)
+                assert rows is not None and len(rows) == 24, f"expected 24 forecast rows issued at {cutoff}"
+                assert pd.DatetimeIndex(rows["target_time"]).equals(targets), f"wrong forecast targets at {cutoff}"
+                assert (rows["issue_time"] <= cutoff).all(), "forecast leakage detected"
+                values = rows["predicted_ci"].to_numpy(dtype=float)
+                assert np.isfinite(values).all(), "forecast contains missing or non-finite values"
+                forecast_cache[hour] = values
+            else:
+                raise ValueError("source must be 'forecast' or 'actual'")
+        forecast = forecast_cache[hour]
         training = [record["job"] for record in active if record["job"].deferrable]
         training_ids = policy(now, training, forecast, free)
         training_map = {job.job_id: job for job in training}
@@ -169,13 +199,13 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
         selected_ids = set(inference_ids + training_ids)
         scheduled_gpus = sum(r["job"].gpus for r in active if r["job"].job_id in selected_ids)
         max_hourly_gpus = max(max_hourly_gpus, scheduled_gpus)
-        actual_ci = float(truth_values.at[hour, "actual_ci"])
-        mef = float(truth_values.at[hour, "mef"]) if pd.notna(truth_values.at[hour, "mef"]) else float("nan")
+        actual_ci = float(actual_ci_by_hour[hour])
+        mef_value = mef_by_hour[hour]
+        mef = float(mef_value) if pd.notna(mef_value) else float("nan")
 
         next_event = min(period_end, hour + HOUR)
-        future_arrivals = [record["arrival"] for record in records if record["arrival"] > now]
-        if future_arrivals:
-            next_event = min(next_event, min(future_arrivals))
+        if next_arrival_index < len(records):
+            next_event = min(next_event, records[next_arrival_index]["arrival"])
         for record in active:
             job = record["job"]
             if job.job_id in selected_ids:
@@ -212,6 +242,8 @@ def _simulate(policy: Decision, k: int, gpus: int | None, jobs: pd.DataFrame, tr
                 ).total_seconds() / 3600.0
                 record["deadline_missed"] = bool(job.deferrable and finish_time > job.deadline)
                 record["previous_running"] = False
+                record["finished"] = True
+        active_records = [record for record in active_records if not record["finished"]]
         now = next_event
 
     deferrals = [record for record in records if record["job"].deferrable]
