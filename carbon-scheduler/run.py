@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 import re
 
@@ -14,6 +15,31 @@ from simulator import DATA_DIR, K_VALUES, make_naive_forecast, run_sim
 BASE_DIR = Path(__file__).resolve().parent
 POLICIES = ("run_now", "threshold", "forecast_greedy", "oracle")
 CAPACITIES: tuple[int | None, ...] = (64, 32, 128, None)
+
+
+def iter_runs(
+    jobs: pd.DataFrame,
+    truth: pd.DataFrame,
+    forecasts: pd.DataFrame,
+    policies: Sequence[str] = POLICIES,
+    k_values: Sequence[int] = K_VALUES,
+    capacities: Sequence[int | None] = CAPACITIES,
+    forecast_error_margin_ci: float = 0.0,
+) -> Iterator[tuple[dict[str, object], pd.DataFrame]]:
+    """Yield in-memory sweep results for the CLI and web interface."""
+    for policy in policies:
+        for k in k_values:
+            for capacity in capacities:
+                metrics, per_job = run_sim(
+                    policy, k, capacity, jobs, truth, forecasts,
+                    forecast_error_margin_ci=forecast_error_margin_ci,
+                )
+                yield {
+                    "policy": policy,
+                    "k": k,
+                    "gpus": "unlimited" if capacity is None else str(capacity),
+                    **metrics,
+                }, per_job
 
 
 def _input_path(value: str) -> Path:
