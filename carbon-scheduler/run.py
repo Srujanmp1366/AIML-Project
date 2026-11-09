@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterator, Sequence
+import math
 from pathlib import Path
 import re
 
@@ -25,6 +26,9 @@ def iter_runs(
     k_values: Sequence[int] = K_VALUES,
     capacities: Sequence[int | None] = CAPACITIES,
     forecast_error_margin_ci: float = 0.0,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+    admission_end: pd.Timestamp | None = None,
 ) -> Iterator[tuple[dict[str, object], pd.DataFrame]]:
     """Yield in-memory sweep results for the CLI and web interface."""
     for policy in policies:
@@ -32,6 +36,7 @@ def iter_runs(
             for capacity in capacities:
                 metrics, per_job = run_sim(
                     policy, k, capacity, jobs, truth, forecasts,
+                    start=start, end=end, admission_end=admission_end,
                     forecast_error_margin_ci=forecast_error_margin_ci,
                 )
                 yield {
@@ -45,6 +50,74 @@ def iter_runs(
 def _input_path(value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() or path.exists() else BASE_DIR / path
+
+
+def _single_data_file(pattern: str, label: str) -> Path:
+    matches = sorted(DATA_DIR.glob(pattern))
+    if len(matches) != 1:
+        raise ValueError(f"Expected one {label} CSV in {DATA_DIR}; specify its path explicitly")
+    return matches[0]
+
+
+def _align_jobs_year(jobs: pd.DataFrame, forecasts: pd.DataFrame) -> pd.DataFrame:
+    """Move a single-year workload to the forecast year without changing its spacing."""
+    arrivals = pd.to_datetime(jobs["arrival"], utc=True, errors="raise")
+    issues = pd.to_datetime(forecasts["issue_time"], utc=True, errors="raise")
+    job_years = set(arrivals.dt.year)
+    trace_years = set(issues.dt.year)
+    if len(job_years) != 1 or len(trace_years) != 1:
+        raise ValueError("Year alignment requires jobs and forecasts to each cover one calendar year")
+    year_delta = next(iter(trace_years)) - next(iter(job_years))
+    shifted = arrivals.map(lambda arrival: arrival + pd.DateOffset(years=year_delta))
+    if not all(
+        (before.month, before.day, before.hour, before.minute, before.second)
+        == (after.month, after.day, after.hour, after.minute, after.second)
+        for before, after in zip(arrivals, shifted)
+    ):
+        raise ValueError("Year alignment would change a job's month, day, or time")
+    aligned = jobs.copy()
+    aligned["arrival"] = shifted
+    return aligned
+
+
+def _simulation_window(
+    jobs: pd.DataFrame,
+    forecasts: pd.DataFrame,
+    max_k: int,
+) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp] | None:
+    """Find a common, completion-buffered window when the trace covers the jobs."""
+    if jobs.empty:
+        raise ValueError("No jobs are available for this grid zone")
+    arrivals = pd.to_datetime(jobs["arrival"], utc=True, errors="raise")
+    issues = pd.DatetimeIndex(pd.to_datetime(forecasts["issue_time"], utc=True).unique()).sort_values()
+    if issues.empty:
+        raise ValueError("Forecast trace contains no issue times")
+    first_hour, last_hour = issues[0] + pd.Timedelta(hours=1), issues[-1] + pd.Timedelta(hours=1)
+    first_arrival, last_arrival = arrivals.min(), arrivals.max()
+    if last_arrival < first_hour or first_arrival > last_hour:
+        raise ValueError(
+            f"Jobs arrive from {first_arrival} to {last_arrival}, but forecast hours "
+            f"run from {first_hour} to {last_hour}; align job dates or supply a matching trace"
+        )
+    start = first_arrival.floor("h")
+    admission_end = last_arrival.ceil("h") + pd.Timedelta(hours=1)
+    duration = pd.to_numeric(jobs["duration_hours"], errors="raise").max()
+    end = admission_end + pd.Timedelta(hours=max_k + math.ceil(float(duration)) + 1)
+    expected_hours = int((end - start) / pd.Timedelta(hours=1))
+    available_hours = issues[(issues >= start - pd.Timedelta(hours=1)) & (issues < end - pd.Timedelta(hours=1))]
+    if start < first_hour or len(available_hours) != expected_hours:
+        # Small caller-supplied traces can still use the simulator's original period.
+        if len(issues) == 1:
+            return None
+        raise ValueError("Forecast trace does not cover the full job and completion window")
+    return start, end, admission_end
+
+
+def _window_forecasts(forecasts: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    issues = pd.to_datetime(forecasts["issue_time"], utc=True)
+    return forecasts.loc[
+        (issues >= start - pd.Timedelta(hours=1)) & (issues < end - pd.Timedelta(hours=1))
+    ]
 
 
 def _draw_figures(summary: pd.DataFrame, output_dir: Path) -> None:
@@ -148,18 +221,32 @@ def _zone_slug(zone: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", zone).strip("._") or "zone"
 
 
-def _sweep(forecast_path: Path, figures: bool, truth_path: Path | None = None) -> None:
+def _sweep(
+    forecast_path: Path | None,
+    figures: bool,
+    truth_path: Path | None = None,
+    align_jobs_year: bool = False,
+) -> None:
+    forecast_path = forecast_path or _single_data_file("forecasts*.csv", "forecast")
+    truth_path = truth_path or _single_data_file("grid_truth*.csv", "grid truth")
     jobs = pd.read_csv(DATA_DIR / "jobs.csv")
-    truth = pd.read_csv(truth_path or DATA_DIR / "grid_truth.csv")
+    truth = pd.read_csv(truth_path)
     forecasts = pd.read_csv(forecast_path)
     results_dir = BASE_DIR / "results"
     per_job_dir = results_dir / "per_job"
-    per_job_dir.mkdir(parents=True, exist_ok=True)
     summaries: list[dict[str, object]] = []
     zone_runs = _zone_frames(jobs, truth, forecasts)
     total_runs = len(zone_runs) * len(POLICIES) * len(K_VALUES) * len(CAPACITIES)
     run_number = 0
     for zone, zone_jobs, zone_truth, zone_forecasts in zone_runs:
+        if align_jobs_year:
+            zone_jobs = _align_jobs_year(zone_jobs, zone_forecasts)
+        window = _simulation_window(zone_jobs, zone_forecasts, max(K_VALUES))
+        if window is not None:
+            start, end, admission_end = window
+            zone_forecasts = _window_forecasts(zone_forecasts, start, end)
+        else:
+            start = end = admission_end = None
         zone_results = results_dir / "zones" / _zone_slug(zone) if zone is not None else results_dir
         zone_per_job_dir = zone_results / "per_job" if zone is not None else per_job_dir
         zone_per_job_dir.mkdir(parents=True, exist_ok=True)
@@ -176,7 +263,8 @@ def _sweep(forecast_path: Path, figures: bool, truth_path: Path | None = None) -
                         flush=True,
                     )
                     metrics, per_job = run_sim(
-                        policy, k, capacity, zone_jobs, zone_truth, zone_forecasts
+                        policy, k, capacity, zone_jobs, zone_truth, zone_forecasts,
+                        start=start, end=end, admission_end=admission_end,
                     )
                     row: dict[str, object] = {
                         "policy": policy,
@@ -211,8 +299,9 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("naive", help="build data/forecasts_naive24.csv")
     sweep = commands.add_parser("sweep", help="run the policy, k, and capacity sweep")
-    sweep.add_argument("--forecast", required=True, help="forecast CSV path")
-    sweep.add_argument("--truth", help="grid truth CSV path (defaults to data/grid_truth.csv)")
+    sweep.add_argument("--forecast", help="forecast CSV path (auto-detected if unique)")
+    sweep.add_argument("--truth", help="grid truth CSV path (auto-detected if unique)")
+    sweep.add_argument("--align-jobs-year", action="store_true", help="move job arrival year to the forecast year in memory")
     sweep.add_argument("--figures", action="store_true", help="write CO2 comparison plots")
     args = parser.parse_args()
     if args.command == "naive":
@@ -220,7 +309,8 @@ def main() -> None:
         print(f"Wrote {output}")
     else:
         truth_path = _input_path(args.truth) if args.truth else None
-        _sweep(_input_path(args.forecast), args.figures, truth_path)
+        forecast_path = _input_path(args.forecast) if args.forecast else None
+        _sweep(forecast_path, args.figures, truth_path, align_jobs_year=args.align_jobs_year)
 
 
 if __name__ == "__main__":

@@ -15,13 +15,13 @@ from urllib.parse import unquote, urlsplit
 import numpy as np
 import pandas as pd
 
-from run import POLICIES, iter_runs
+from run import POLICIES, _align_jobs_year, _simulation_window, _window_forecasts, _zone_frames, iter_runs
 from simulator import DATA_DIR, K_VALUES, run_sim
 
 
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
-MAX_REQUEST_BYTES = 25_000_000
+MAX_REQUEST_BYTES = 80_000_000
 
 
 def _json_safe(value: object) -> object:
@@ -41,22 +41,34 @@ def _json_safe(value: object) -> object:
 
 
 def _forecast_names() -> list[str]:
-    return sorted(
-        path.name for path in DATA_DIR.glob("*.csv")
-        if path.name not in {"jobs.csv", "grid_truth.csv"}
-    )
+    return sorted(path.name for path in DATA_DIR.glob("forecasts*.csv"))
+
+
+def _truth_names() -> list[str]:
+    return sorted(path.name for path in DATA_DIR.glob("grid_truth*.csv"))
+
+
+def _zones_in_truth(filename: str) -> list[str]:
+    path = DATA_DIR / filename
+    if "zone" not in pd.read_csv(path, nrows=0).columns:
+        return []
+    zones = pd.read_csv(path, usecols=["zone"])["zone"]
+    return sorted(zones.dropna().astype(str).str.strip().unique().tolist())
 
 
 def _config() -> dict[str, object]:
     forecasts = _forecast_names()
+    truths = _truth_names()
     return {
         "policies": list(POLICIES),
         "k_values": K_VALUES,
         "capacities": [64, 32, 128, None],
         "forecasts": forecasts,
+        "truths": truths,
+        "truth_zones": {name: _zones_in_truth(name) for name in truths},
         "local_ready": (
             (DATA_DIR / "jobs.csv").is_file()
-            and (DATA_DIR / "grid_truth.csv").is_file()
+            and bool(truths)
             and bool(forecasts)
         ),
     }
@@ -83,14 +95,42 @@ def _frames(payload: dict[str, object]) -> tuple[pd.DataFrame, pd.DataFrame, pd.
     if source != "local":
         raise ValueError("source must be local or upload")
 
+    truth_name = payload.get("truth_file")
+    if not isinstance(truth_name, str) or truth_name not in _truth_names():
+        raise ValueError("Select an available grid truth CSV")
     forecast_name = payload.get("forecast_file")
     if not isinstance(forecast_name, str) or forecast_name not in _forecast_names():
         raise ValueError("Select an available forecast CSV")
     return (
         pd.read_csv(DATA_DIR / "jobs.csv"),
-        pd.read_csv(DATA_DIR / "grid_truth.csv"),
+        pd.read_csv(DATA_DIR / truth_name),
         pd.read_csv(DATA_DIR / forecast_name),
     )
+
+
+def _selected_zone(
+    jobs: pd.DataFrame,
+    truth: pd.DataFrame,
+    forecasts: pd.DataFrame,
+    requested_zone: object,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if "zone" in truth.columns and "zone" in forecasts.columns:
+        if not isinstance(requested_zone, str) or not requested_zone.strip():
+            raise ValueError("Choose a grid zone for these multi-zone traces")
+        zone = requested_zone.strip()
+        truth = truth.loc[truth["zone"].astype(str).str.strip() == zone]
+        forecasts = forecasts.loc[forecasts["zone"].astype(str).str.strip() == zone]
+        if "zone" in jobs.columns:
+            jobs = jobs.loc[jobs["zone"].astype(str).str.strip() == zone]
+        if truth.empty or forecasts.empty:
+            raise ValueError(f"No matching grid truth and forecast rows for zone {zone}")
+    elif requested_zone not in (None, ""):
+        raise ValueError("These traces do not contain grid zones")
+    frames = _zone_frames(jobs, truth, forecasts)
+    if len(frames) != 1:
+        raise ValueError("Select one grid zone")
+    _, selected_jobs, selected_truth, selected_forecasts = frames[0]
+    return selected_jobs, selected_truth, selected_forecasts
 
 
 def _options(payload: dict[str, object]) -> tuple[str, int, int | None]:
@@ -156,16 +196,29 @@ class Handler(BaseHTTPRequestHandler):
         try:
             size = int(self.headers.get("Content-Length", "0"))
             if size <= 0 or size > MAX_REQUEST_BYTES:
-                self._send_json(413, {"error": "Request must be between 1 byte and 25 MB"})
+                self._send_json(413, {"error": "Request must be between 1 byte and 80 MB"})
                 return
             payload = json.loads(self.rfile.read(size))
             if not isinstance(payload, dict):
                 raise ValueError("Request body must be an object")
             policy, k, gpus = _options(payload)
             jobs, truth, forecasts = _frames(payload)
+            jobs, truth, forecasts = _selected_zone(jobs, truth, forecasts, payload.get("zone"))
+            align_jobs_year = payload.get("align_jobs_year", False)
+            if not isinstance(align_jobs_year, bool):
+                raise ValueError("align_jobs_year must be true or false")
+            if align_jobs_year:
+                jobs = _align_jobs_year(jobs, forecasts)
+            window = _simulation_window(jobs, forecasts, k)
+            if window is not None:
+                start, end, admission_end = window
+                forecasts = _window_forecasts(forecasts, start, end)
+            else:
+                start = end = admission_end = None
             if path == "/api/simulate":
                 metrics, per_job = run_sim(
                     policy, k, gpus, jobs, truth, forecasts,
+                    start=start, end=end, admission_end=admission_end,
                 )
                 self._send_json(200, {
                     "metrics": metrics,
@@ -177,6 +230,7 @@ class Handler(BaseHTTPRequestHandler):
                     policies=POLICIES,
                     k_values=(k,),
                     capacities=(gpus,),
+                    start=start, end=end, admission_end=admission_end,
                 )]
                 self._send_json(200, {"rows": rows})
         except (AssertionError, FileNotFoundError, KeyError, TypeError, ValueError) as exc:

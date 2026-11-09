@@ -1,6 +1,6 @@
 # Carbon aware scheduler
 
-This small Python codebase compares hourly scheduling policies for ML jobs against an Indian-grid carbon-intensity trace. It consumes job, actual-grid, and forecast CSV files; it does not train a forecaster or fit an MEF regression. No sample data is included.
+This small Python codebase compares hourly scheduling policies for ML jobs against Indian-grid carbon-intensity traces. It consumes job, actual-grid, and forecast CSV files; it does not train a forecaster or fit an MEF regression.
 
 Requires Python 3.10+, pandas, numpy, and matplotlib. Install pytest to run the inline-fixture test suite.
 
@@ -30,8 +30,10 @@ npm.cmd run dev
 
 Open the URL Vite prints (normally `http://127.0.0.1:5173`). The API runs at
 `http://127.0.0.1:8000`; Vite forwards `/api` requests to it. The interface can read
-`data/jobs.csv`, `data/grid_truth.csv`, and a forecast CSV in `data/`, or you can
-upload all three CSV files in the browser. Uploaded files are not saved to disk.
+`data/jobs.csv`, a `grid_truth*.csv`, and a `forecasts*.csv` in `data/`, or you can
+upload all three CSV files in the browser. Select one grid zone for multi-zone traces.
+Uploaded files are not saved to disk. The optional year-alignment checkbox shifts job
+arrival dates in memory to the forecast year when the files cover different years.
 
 For a single-server build, run `npm run build` from `frontend/`, then run
 `python api.py` from `carbon-scheduler/` and open `http://127.0.0.1:8000`.
@@ -39,11 +41,17 @@ The CLI commands below remain available separately and still write output files.
 
 ## Inputs
 
-Put these files in `data/`:
+The current `data/` directory contains:
 
 - `jobs.csv`: `job_id`, `arrival`, `duration_hours`, `gpus`, `deferrable`
-- `grid_truth.csv`: `time`, `actual_ci`, `mef`
-- `forecasts_<model>.csv`: `issue_time`, `target_time`, `predicted_ci`
+- `grid_truth_all_zones.csv`: `zone`, `time`, `actual_ci`, `mef`
+- `forecasts_lightgbm_all_zones (1).csv`: `zone`, `issue_time`, `target_time`, `predicted_ci`
+
+The supplied jobs arrive in January 2026, while both grid traces cover 2025. Enable
+year alignment in the React interface, or pass `--align-jobs-year` to the CLI, to
+simulate those jobs on the corresponding January dates in 2025. This does not edit
+`jobs.csv`. Alternatively, supply grid truth and forecasts covering January 2026.
+The current `mef` column is empty, so marginal-emissions results are unavailable.
 
 For multi-grid runs, add a `zone` column to **both** grid truth and forecast CSVs. The same zone value must identify the same grid in both files. Each zone must have a complete actual carbon-intensity trace matching its forecasts. The simulator runs each zone independently and writes a combined `results/summary.csv` with a `zone` column, plus per-zone summaries and per-job files under `results/zones/<zone>/`. If `jobs.csv` has no `zone` column, the same workload is simulated for every zone; if it does have one, each zone uses only its matching jobs.
 
@@ -56,16 +64,20 @@ The simulator treats `deferrable` values `true`, `1`, and `yes` as true (case in
 From this directory, use an environment with the dependencies above, then:
 
 ```bash
-python run.py naive
-python run.py sweep --forecast data/forecasts_naive24.csv
-python run.py sweep --forecast data/forecasts_naive24.csv --figures
-python run.py sweep --forecast data/forecasts_lightgbm_all_zones.csv --truth data/grid_truth_all_zones.csv
-pytest
+python run.py sweep --align-jobs-year
+python run.py sweep --align-jobs-year --figures
 ```
 
-`naive` writes `data/forecasts_naive24.csv`, using the actual CI from 24 hours before each target hour. `sweep` runs `run_now`, `threshold`, `forecast_greedy`, and `oracle` for `k = 6, 12, 24, 48` and capacities of 64, 32, 128, and unlimited GPUs. It writes `results/summary.csv` and one CSV per run under `results/per_job/`. For multi-zone inputs, pass the matching actual trace with `--truth`; results are also written separately under `results/zones/<zone>/`. `--figures` also writes comparison plots.
+`sweep` auto-detects the truth and forecast files when each has one matching file in
+`data/`. It runs `run_now`, `threshold`, `forecast_greedy`, and `oracle` for
+`k = 6, 12, 24, 48` and capacities of 64, 32, 128, and unlimited GPUs. It writes
+`results/summary.csv` and per-job files under `results/zones/<zone>/` for multi-zone
+inputs. Use `--truth` and `--forecast` to select files when there is more than one
+match. `--figures` also writes comparison plots.
 
-The test period defaults to the hourly starts represented by the forecast file. The `run_sim` API also accepts an optional UTC `start` and exclusive `end` timestamp.
+The CLI and React API limit the simulation to job arrivals plus enough hours for
+completion. The `run_sim` API also accepts an optional UTC `start` and exclusive
+`end` timestamp.
 
 ## Dashboard
 

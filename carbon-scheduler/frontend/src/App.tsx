@@ -26,6 +26,8 @@ interface Config {
   k_values: number[]
   capacities: Array<number | null>
   forecasts: string[]
+  truths: string[]
+  truth_zones: Record<string, string[]>
   local_ready: boolean
 }
 
@@ -142,6 +144,10 @@ function App() {
   const [view, setView] = useState<View>('overview')
   const [source, setSource] = useState<'local' | 'upload'>('local')
   const [forecastFile, setForecastFile] = useState('')
+  const [truthFile, setTruthFile] = useState('')
+  const [zone, setZone] = useState('')
+  const [uploadZone, setUploadZone] = useState('')
+  const [alignJobsYear, setAlignJobsYear] = useState(false)
   const [uploads, setUploads] = useState<UploadFiles>(initialUploads)
   const [policy, setPolicy] = useState<Policy>('forecast_greedy')
   const [k, setK] = useState(24)
@@ -160,6 +166,8 @@ function App() {
       .then((data) => {
         setConfig(data)
         setForecastFile(data.forecasts[0] || '')
+        setTruthFile(data.truths[0] || '')
+        setZone(data.truth_zones[data.truths[0]]?.[0] || '')
       })
       .catch((err: Error) => setError(`Cannot reach the Python API: ${err.message}`))
   }, [])
@@ -167,10 +175,10 @@ function App() {
   useEffect(() => {
     setResult(null)
     setComparison(null)
-  }, [source, forecastFile, uploads, policy, k, capacity])
+  }, [source, forecastFile, truthFile, zone, uploadZone, alignJobsYear, uploads, policy, k, capacity])
 
   const ready = source === 'local'
-    ? Boolean(config?.local_ready && forecastFile)
+    ? Boolean(config?.local_ready && forecastFile && truthFile)
     : Boolean(uploads.jobs && uploads.grid_truth && uploads.forecasts)
 
   async function payload() {
@@ -179,8 +187,10 @@ function App() {
       policy,
       k,
       gpus: capacity === 'unlimited' ? null : Number(capacity),
+      zone: source === 'local' ? zone || null : uploadZone.trim() || null,
+      align_jobs_year: alignJobsYear,
     }
-    if (source === 'local') return { ...common, forecast_file: forecastFile }
+    if (source === 'local') return { ...common, truth_file: truthFile, forecast_file: forecastFile }
     if (!uploads.jobs || !uploads.grid_truth || !uploads.forecasts) {
       throw new Error('Choose all three CSV files first')
     }
@@ -281,12 +291,26 @@ function App() {
                 <button className={source === 'upload' ? 'selected' : ''} onClick={() => setSource('upload')}>Upload CSV files</button>
               </div>
               {source === 'local' ? (
-                <div className="field-group">
-                  <label htmlFor="forecast">Forecast trace</label>
-                  <select id="forecast" value={forecastFile} onChange={(event) => setForecastFile(event.target.value)}>
-                    {config?.forecasts.length ? config.forecasts.map((name) => <option key={name} value={name}>{name}</option>) : <option value="">No forecast CSV found</option>}
-                  </select>
-                  <div className={`data-status ${config?.local_ready ? 'good' : 'warn'}`}><span />{config?.local_ready ? 'jobs.csv and grid_truth.csv found in data/' : 'Add jobs.csv, grid_truth.csv, and a forecast CSV to data/'}</div>
+                <div className="local-data-fields">
+                  <div className="field-group">
+                    <label htmlFor="truth">Grid truth trace</label>
+                    <select id="truth" value={truthFile} onChange={(event) => { const name = event.target.value; setTruthFile(name); setZone(config?.truth_zones[name]?.[0] || '') }}>
+                      {config?.truths.length ? config.truths.map((name) => <option key={name} value={name}>{name}</option>) : <option value="">No grid truth CSV found</option>}
+                    </select>
+                  </div>
+                  <div className="field-group">
+                    <label htmlFor="forecast">Forecast trace</label>
+                    <select id="forecast" value={forecastFile} onChange={(event) => setForecastFile(event.target.value)}>
+                      {config?.forecasts.length ? config.forecasts.map((name) => <option key={name} value={name}>{name}</option>) : <option value="">No forecast CSV found</option>}
+                    </select>
+                  </div>
+                  {Boolean(config?.truth_zones[truthFile]?.length) && <div className="field-group">
+                    <label htmlFor="zone">Grid zone</label>
+                    <select id="zone" value={zone} onChange={(event) => setZone(event.target.value)}>
+                      {config?.truth_zones[truthFile]?.map((name) => <option key={name} value={name}>{name}</option>)}
+                    </select>
+                  </div>}
+                  <div className={`data-status ${config?.local_ready ? 'good' : 'warn'}`}><span />{config?.local_ready ? 'Jobs, grid truth, and forecast traces found in data/' : 'Add jobs, grid truth, and forecast CSVs to data/'}</div>
                 </div>
               ) : (
                 <div className="upload-list">
@@ -297,9 +321,11 @@ function App() {
                       <input type="file" accept=".csv,text/csv" onChange={(event) => setUploads((current) => ({ ...current, [key]: event.target.files?.[0] || null }))} />
                     </label>
                   ))}
+                  <div className="field-group"><label htmlFor="upload-zone">Grid zone (for multi-zone uploads)</label><input id="upload-zone" value={uploadZone} onChange={(event) => setUploadZone(event.target.value)} placeholder="For example, IN-EA" /></div>
                   <p className="field-hint">Uploads are processed in memory and are not saved by the API.</p>
                 </div>
               )}
+              <label className="align-option"><input type="checkbox" checked={alignJobsYear} onChange={(event) => setAlignJobsYear(event.target.checked)} /><span>Align job arrival year to forecast year in memory<small>Use this when job dates and trace dates differ. The jobs CSV is not changed.</small></span></label>
             </div>
 
             <div className="panel scenario-panel">

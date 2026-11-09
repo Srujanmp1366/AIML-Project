@@ -79,6 +79,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .segmented button { border: none; background: transparent; color: #829388; flex: 1; border-radius: 7px; padding: 9px 6px; font-size: 11px; font-weight: 700; white-space: nowrap; }
 .segmented button.selected { background: white; color: #27754a; box-shadow: 0 1px 5px rgba(32,73,42,.09); }
 .field-group { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.local-data-fields { display: grid; gap: 12px; }
+.align-option { display: flex; align-items: flex-start; gap: 9px; margin-top: 12px; color: #405d4c; font-size: 11px; font-weight: 700; line-height: 1.4; cursor: pointer; }
+.align-option input { margin: 2px 0 0; accent-color: #27754a; }
+.align-option small { display: block; margin-top: 4px; color: #91a095; font-size: 11px; font-weight: 400; }
 .field-group label { font-size: 11px; font-weight: 800; color: #405d4c; }
 .field-group select, .field-group input, .table-controls input, .table-controls select { border: 1px solid #dce6da; background: white; color: #304638; border-radius: 8px; height: 39px; padding: 0 12px; outline: none; width: 100%; font-size: 12px; }
 .field-group select:focus, .field-group input:focus, .table-controls input:focus, .table-controls select:focus { border-color: #53bb7b; box-shadow: 0 0 0 3px rgba(83,187,123,.13); }
