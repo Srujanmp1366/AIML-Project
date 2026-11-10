@@ -146,6 +146,21 @@ def _options(payload: dict[str, object]) -> tuple[str, int, int | None]:
     return policy, k, gpus
 
 
+def _trace_series(truth: pd.DataFrame, forecasts: pd.DataFrame) -> list[dict[str, object]]:
+    """Pair actual CI with the forecast available one hour before each hour."""
+    issues = pd.to_datetime(forecasts["issue_time"], utc=True)
+    targets = pd.to_datetime(forecasts["target_time"], utc=True)
+    one_hour = forecasts.loc[targets == issues + pd.Timedelta(hours=1), ["target_time", "predicted_ci"]].copy()
+    one_hour["time"] = pd.to_datetime(one_hour.pop("target_time"), utc=True)
+    actual = truth[["time", "actual_ci"]].copy()
+    actual["time"] = pd.to_datetime(actual["time"], utc=True)
+    paired = one_hour.merge(actual, on="time", validate="one_to_one").sort_values("time")
+    if len(paired) > 240:
+        indices = np.linspace(0, len(paired) - 1, 240).round().astype(int)
+        paired = paired.iloc[indices]
+    return paired[["time", "actual_ci", "predicted_ci"]].to_dict("records")
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, body: object) -> None:
         encoded = json.dumps(_json_safe(body), allow_nan=False).encode("utf-8")
@@ -223,6 +238,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {
                     "metrics": metrics,
                     "jobs": per_job.to_dict("records"),
+                    "trace": _trace_series(truth, forecasts),
                 })
             else:
                 rows = [summary for summary, _ in iter_runs(

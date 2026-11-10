@@ -9,6 +9,9 @@ Requires Python 3.10+, pandas, numpy, and matplotlib. Install pytest to run the 
 The frontend lives in `frontend/`. It calls the local Python API in `api.py`, which uses
 `simulator.run_sim` for a single scenario and `run.iter_runs` for policy comparisons.
 The interface shows emissions, completion and delay metrics, and per-job outcomes.
+After a simulation, the Overview also graphs actual versus one-hour-ahead forecast
+carbon intensity and the distribution of job start waits. Each graph can be
+downloaded as an SVG image for a report or presentation.
 Web requests keep uploaded data and results in memory; they do not write CSV files.
 
 If you do not already have `.venv`, create it with `python -m venv .venv`.
