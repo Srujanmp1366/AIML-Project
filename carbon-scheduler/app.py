@@ -8,6 +8,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from reporting import RESULTS_DIR, save_dashboard_charts
+
 
 BASE_DIR = Path(__file__).resolve().parent
 SUMMARY_PATH = BASE_DIR / "results" / "summary.csv"
@@ -309,3 +311,18 @@ st.dataframe(
         "gpu_utilisation": st.column_config.NumberColumn("GPU utilization", format="percent"),
     },
 )
+
+saved_files = save_dashboard_charts(
+    comparison, trend, table, selected_zone, int(selected_k), selected_capacity, accounting_key,
+)
+with st.expander("Saved CSV and PNG outputs"):
+    st.caption(f"All files are in `{RESULTS_DIR.relative_to(BASE_DIR)}/`.")
+    for label, filename in saved_files.items():
+        path = RESULTS_DIR / filename
+        st.download_button(
+            label=f"Download {label.replace('_', ' ')} ({path.suffix.upper().lstrip('.')})",
+            data=path.read_bytes(),
+            file_name=filename,
+            mime="image/png" if path.suffix == ".png" else "text/csv",
+            key=filename,
+        )

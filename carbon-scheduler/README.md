@@ -10,16 +10,16 @@ The frontend lives in `frontend/`. It calls the local Python API in `api.py`, wh
 `simulator.run_sim` for a single scenario and `run.iter_runs` for policy comparisons.
 The interface shows emissions, completion and delay metrics, and per-job outcomes.
 After a simulation, the Overview also graphs actual versus one-hour-ahead forecast
-carbon intensity and the distribution of job start waits. Each graph can be
-downloaded as an SVG image for a report or presentation.
-Web requests keep uploaded data and results in memory; they do not write CSV files.
+carbon intensity and the distribution of job start waits. The API saves the summary
+and per-job tables as CSV and the emissions, carbon-intensity, and wait graphs as PNG,
+all directly in `results/`. The dashboard provides download links to these files.
 
 If you do not already have `.venv`, create it with `python -m venv .venv`.
 From `carbon-scheduler`, start the API in one PowerShell terminal:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-pip install numpy pandas
+python -m pip install -r requirements.txt
 python api.py
 ```
 
@@ -35,8 +35,9 @@ Open the URL Vite prints (normally `http://127.0.0.1:5173`). The API runs at
 `http://127.0.0.1:8000`; Vite forwards `/api` requests to it. The interface can read
 `data/jobs.csv`, a `grid_truth*.csv`, and a `forecasts*.csv` in `data/`, or you can
 upload all three CSV files in the browser. Select one grid zone for multi-zone traces.
-Uploaded files are not saved to disk. The optional year-alignment checkbox shifts job
-arrival dates in memory to the forecast year when the files cover different years.
+Uploaded input files are not saved to disk; simulation outputs are saved in `results/`.
+The optional year-alignment checkbox shifts job arrival dates in memory to the
+forecast year when the files cover different years.
 
 For a single-server build, run `npm run build` from `frontend/`, then run
 `python api.py` from `carbon-scheduler/` and open `http://127.0.0.1:8000`.
@@ -67,16 +68,22 @@ The simulator treats `deferrable` values `true`, `1`, and `yes` as true (case in
 From this directory, use an environment with the dependencies above, then:
 
 ```bash
+python run.py scenario --zone IN-EA --align-jobs-year
 python run.py sweep --align-jobs-year
-python run.py sweep --align-jobs-year --figures
 ```
+
+`scenario` runs the default forecast-greedy policy with a 24-hour deferral window
+and 64 GPUs for one zone. It creates `results/summary.csv`, a per-job CSV, and three
+PNG graphs in the same `results/` folder. Use `--policy`, `--k`, and `--gpus` to
+change the scenario. The React interface writes the same output format.
 
 `sweep` auto-detects the truth and forecast files when each has one matching file in
 `data/`. It runs `run_now`, `threshold`, `forecast_greedy`, and `oracle` for
 `k = 6, 12, 24, 48` and capacities of 64, 32, 128, and unlimited GPUs. It writes
-`results/summary.csv` and per-job files under `results/zones/<zone>/` for multi-zone
-inputs. Use `--truth` and `--forecast` to select files when there is more than one
-match. `--figures` also writes comparison plots.
+`results/summary.csv`, per-job CSV files, per-zone summary CSV files, and comparison
+PNG plots directly in `results/`. The older per-zone subfolders are also kept for
+compatibility. Use `--truth` and `--forecast` to select files when there is more than
+one match. Use `--no-figures` to skip the PNG plots.
 
 The CLI and React API limit the simulation to job arrivals plus enough hours for
 completion. The `run_sim` API also accepts an optional UTC `start` and exclusive
@@ -91,7 +98,13 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The dashboard loads `results/summary.csv` by default. Generate it first with the sweep command above if it is missing. You can also upload a compatible summary CSV. Use the sidebar to select a policy, deferral window, GPU capacity, and average or marginal emissions; the dashboard shows headline metrics, policy comparisons, savings trends, and deadline trade-offs. Assumptions and limitations are explained in the dashboard and below.
+The dashboard loads `results/summary.csv` by default. Generate it first with the
+scenario or sweep command above if it is missing. You can also upload a compatible
+summary CSV. Use the sidebar to select a policy, deferral window, GPU capacity, and
+average or marginal emissions; the dashboard shows headline metrics, policy
+comparisons, savings trends, and deadline trade-offs. It also saves the filtered
+dashboard table as CSV and all three dashboard graphs as PNG in `results/`, with
+download buttons in the **Saved CSV and PNG outputs** section.
 
 ## Model assumptions
 

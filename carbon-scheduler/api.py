@@ -1,4 +1,4 @@
-"""Local JSON API for the React interface; simulation results stay in memory."""
+"""Local JSON API for the React interface and saved simulation outputs."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from run import POLICIES, _align_jobs_year, _simulation_window, _window_forecasts, _zone_frames, iter_runs
+from reporting import RESULTS_DIR, save_comparison, save_scenario, trace_series
 from simulator import DATA_DIR, K_VALUES, run_sim
 
 
@@ -146,21 +147,6 @@ def _options(payload: dict[str, object]) -> tuple[str, int, int | None]:
     return policy, k, gpus
 
 
-def _trace_series(truth: pd.DataFrame, forecasts: pd.DataFrame) -> list[dict[str, object]]:
-    """Pair actual CI with the forecast available one hour before each hour."""
-    issues = pd.to_datetime(forecasts["issue_time"], utc=True)
-    targets = pd.to_datetime(forecasts["target_time"], utc=True)
-    one_hour = forecasts.loc[targets == issues + pd.Timedelta(hours=1), ["target_time", "predicted_ci"]].copy()
-    one_hour["time"] = pd.to_datetime(one_hour.pop("target_time"), utc=True)
-    actual = truth[["time", "actual_ci"]].copy()
-    actual["time"] = pd.to_datetime(actual["time"], utc=True)
-    paired = one_hour.merge(actual, on="time", validate="one_to_one").sort_values("time")
-    if len(paired) > 240:
-        indices = np.linspace(0, len(paired) - 1, 240).round().astype(int)
-        paired = paired.iloc[indices]
-    return paired[["time", "actual_ci", "predicted_ci"]].to_dict("records")
-
-
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, body: object) -> None:
         encoded = json.dumps(_json_safe(body), allow_nan=False).encode("utf-8")
@@ -176,10 +162,30 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/config":
             self._send_json(200, _config())
             return
+        if path.startswith("/api/results/"):
+            self._serve_result(path.removeprefix("/api/results/"))
+            return
         if path.startswith("/api/"):
             self._send_json(404, {"error": "Unknown API endpoint"})
             return
         self._serve_frontend(path)
+
+    def _serve_result(self, encoded_name: str) -> None:
+        name = unquote(encoded_name)
+        target = (RESULTS_DIR / name).resolve()
+        if not name or name != Path(name).name or not target.is_relative_to(RESULTS_DIR.resolve()) or target.suffix not in {".csv", ".png"}:
+            self._send_json(403, {"error": "Forbidden result path"})
+            return
+        if not target.is_file():
+            self._send_json(404, {"error": "Result file not found"})
+            return
+        content = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
 
     def _serve_frontend(self, path: str) -> None:
         if not FRONTEND_DIST.is_dir():
@@ -219,6 +225,8 @@ class Handler(BaseHTTPRequestHandler):
             policy, k, gpus = _options(payload)
             jobs, truth, forecasts = _frames(payload)
             jobs, truth, forecasts = _selected_zone(jobs, truth, forecasts, payload.get("zone"))
+            zone_value = payload.get("zone")
+            zone = zone_value.strip() if isinstance(zone_value, str) and zone_value.strip() else None
             align_jobs_year = payload.get("align_jobs_year", False)
             if not isinstance(align_jobs_year, bool):
                 raise ValueError("align_jobs_year must be true or false")
@@ -235,10 +243,13 @@ class Handler(BaseHTTPRequestHandler):
                     policy, k, gpus, jobs, truth, forecasts,
                     start=start, end=end, admission_end=admission_end,
                 )
+                trace = trace_series(truth, forecasts)
+                files = save_scenario(metrics, per_job, trace, policy, k, gpus, zone)
                 self._send_json(200, {
                     "metrics": metrics,
                     "jobs": per_job.to_dict("records"),
-                    "trace": _trace_series(truth, forecasts),
+                    "trace": trace.to_dict("records"),
+                    "files": files,
                 })
             else:
                 rows = [summary for summary, _ in iter_runs(
@@ -248,7 +259,8 @@ class Handler(BaseHTTPRequestHandler):
                     capacities=(gpus,),
                     start=start, end=end, admission_end=admission_end,
                 )]
-                self._send_json(200, {"rows": rows})
+                files = save_comparison(rows, zone, k, gpus)
+                self._send_json(200, {"rows": rows, "files": files})
         except (AssertionError, FileNotFoundError, KeyError, TypeError, ValueError) as exc:
             self._send_json(400, {"error": str(exc) or "Invalid simulation input"})
         except Exception:

@@ -56,6 +56,7 @@ interface SimulationResult {
   metrics: Metrics
   jobs: JobRow[]
   trace: TracePoint[]
+  files: Record<string, string>
 }
 
 interface CompareRow extends Metrics {
@@ -146,18 +147,8 @@ function EmissionsChart({ metrics, policy }: { metrics: Metrics; policy: Policy 
   )
 }
 
-function downloadSvg(id: string, filename: string): void {
-  const original = document.getElementById(id)
-  if (!(original instanceof SVGSVGElement)) return
-  const graphic = original.cloneNode(true) as SVGSVGElement
-  graphic.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
-  const blob = new Blob([new XMLSerializer().serializeToString(graphic)], { type: 'image/svg+xml;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = filename
-  link.click()
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
+function SavedFiles({ files }: { files: Record<string, string> }) {
+  return <div className="panel output-panel"><div><span className="section-index">SAVED OUTPUT</span><h3>CSV tables and PNG graphs</h3><p>Saved in carbon-scheduler/results/</p></div><div className="output-links">{Object.entries(files).map(([kind, name]) => <a key={kind} href={`/api/results/${encodeURIComponent(name)}`} download>{kind.replace(/_/g, ' ')} <span>{name}</span></a>)}</div></div>
 }
 
 function TraceChart({ points }: { points: TracePoint[] }) {
@@ -232,6 +223,7 @@ function App() {
   const [result, setResult] = useState<SimulationResult | null>(null)
   const [resultPolicy, setResultPolicy] = useState<Policy>('forecast_greedy')
   const [comparison, setComparison] = useState<CompareRow[] | null>(null)
+  const [comparisonFiles, setComparisonFiles] = useState<Record<string, string> | null>(null)
   const [loading, setLoading] = useState<'simulate' | 'compare' | null>(null)
   const [error, setError] = useState('')
   const [search, setSearch] = useState('')
@@ -252,6 +244,7 @@ function App() {
   useEffect(() => {
     setResult(null)
     setComparison(null)
+    setComparisonFiles(null)
   }, [source, forecastFile, truthFile, zone, uploadZone, alignJobsYear, uploads, policy, k, capacity])
 
   const ready = source === 'local'
@@ -286,6 +279,7 @@ function App() {
       setResult(data)
       setResultPolicy(policy)
       setComparison(null)
+      setComparisonFiles(null)
       setView('overview')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Simulation failed')
@@ -299,8 +293,9 @@ function App() {
     setLoading('compare')
     setError('')
     try {
-      const data = await request<{ rows: CompareRow[] }>('/api/compare', await payload())
+      const data = await request<{ rows: CompareRow[]; files: Record<string, string> }>('/api/compare', await payload())
       setComparison(data.rows)
+      setComparisonFiles(data.files)
       setView('compare')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Comparison failed')
@@ -430,9 +425,10 @@ function App() {
                 <div className="panel detail-panel"><div className="panel-header"><div><span className="section-index">OPERATIONS</span><h3>Workload outcomes</h3></div></div><div className="detail-list"><div><span>Mean added delay</span><strong>{number(metrics.mean_added_delay_hours)} h</strong></div><div><span>95th percentile delay</span><strong>{number(metrics.p95_added_delay_hours)} h</strong></div><div><span>GPU utilisation</span><strong>{metrics.gpu_utilisation == null ? '—' : `${number(metrics.gpu_utilisation * 100)}%`}</strong></div><div><span>Total energy</span><strong>{number(metrics.total_kwh)} kWh</strong></div><div><span>Marginal emissions</span><strong>{number(metrics.emissions_marg_kg)} kg</strong></div></div></div>
               </div>
               <div className="graphs-grid">
-                <div className="panel graph-panel"><div className="panel-header"><div><span className="section-index">GRID SIGNAL</span><h3>Carbon intensity over time</h3></div><button className="graph-export" onClick={() => downloadSvg('carbon-intensity-graph', 'carbon-intensity.svg')} disabled={!result.trace.length}>Download SVG</button></div><TraceChart points={result.trace} /><p className="chart-caption">The forecast shown for each hour was issued one hour earlier. Values are sampled when the period exceeds 240 hours.</p></div>
-                <div className="panel graph-panel"><div className="panel-header"><div><span className="section-index">JOB DELAY</span><h3>Start wait distribution</h3></div><button className="graph-export" onClick={() => downloadSvg('job-wait-graph', 'job-start-waits.svg')} disabled={!result.jobs.some((job) => job.start_wait_hours != null)}>Download SVG</button></div><WaitChart jobs={result.jobs} /><p className="chart-caption">Counts include jobs that started; jobs without a start time are excluded.</p></div>
+                <div className="panel graph-panel"><div className="panel-header"><div><span className="section-index">GRID SIGNAL</span><h3>Carbon intensity over time</h3></div><a className="graph-export" href={`/api/results/${encodeURIComponent(result.files.carbon_intensity)}`} download>Download PNG</a></div><TraceChart points={result.trace} /><p className="chart-caption">The forecast shown for each hour was issued one hour earlier. Values are sampled when the period exceeds 240 hours.</p></div>
+                <div className="panel graph-panel"><div className="panel-header"><div><span className="section-index">JOB DELAY</span><h3>Start wait distribution</h3></div><a className="graph-export" href={`/api/results/${encodeURIComponent(result.files.start_waits)}`} download>Download PNG</a></div><WaitChart jobs={result.jobs} /><p className="chart-caption">Counts include jobs that started; jobs without a start time are excluded.</p></div>
               </div>
+              <SavedFiles files={result.files} />
               <div className="next-action"><div><strong>See what happened to each job</strong><p>Inspect arrival, start, finish, wait time, and deadline outcomes.</p></div><button onClick={() => setView('jobs')}>Open job explorer <span>→</span></button></div>
             </> : <div className="empty-panel"><div className="empty-symbol">↗</div><h3>Your results will appear here</h3><p>{ready ? 'Run a simulation to see emissions, job outcomes, and GPU utilisation.' : 'Add the required CSV inputs above, then run a simulation.'}</p></div>}
           </>}
@@ -444,6 +440,7 @@ function App() {
 
           {view === 'compare' && <>
             <section className="section-heading results-heading"><div><span className="section-index">02 / COMPARE</span><h2>Policy comparison</h2></div><p>Same trace, deferral window, and GPU capacity for every policy.</p></section>
+            {comparisonFiles && <SavedFiles files={comparisonFiles} />}
             {comparison ? <div className="panel compare-panel"><div className="panel-header"><div><span className="section-index">AVERAGE EMISSIONS</span><h3>Side-by-side policies</h3></div><span className="panel-badge">Lower is better</span></div><div className="compare-bars">{comparison.map((row) => <div className="compare-item" key={row.policy}><div className="compare-label"><strong>{POLICY_NAME[row.policy]}</strong><span>{number(row.emissions_avg_kg)} kg CO₂</span></div><div className="bar-track"><div className={`bar-fill ${row.policy === 'run_now' ? 'gray' : row.policy === 'oracle' ? 'blue' : 'green'}`} style={{ width: `${Math.max(0, ((row.emissions_avg_kg || 0) / comparisonMax) * 100)}%` }} /></div><div className="compare-detail"><span>{number(row.percent_saved_vs_run_now_avg_pct)}% saved</span><span>{number(row.deadline_misses, 0)} deadline misses</span><span>{number(row.mean_added_delay_hours)} h mean delay</span></div></div>)}</div><p className="chart-caption">Savings show as unavailable when a run leaves jobs unfinished. Oracle uses actual future CI as a forecast benchmark.</p></div> : <div className="empty-panel"><div className="empty-symbol">▥</div><h3>No comparison yet</h3><p>Select your inputs, then choose “Compare all policies” above.</p></div>}
           </>}
 

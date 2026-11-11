@@ -120,7 +120,7 @@ def _window_forecasts(forecasts: pd.DataFrame, start: pd.Timestamp, end: pd.Time
     ]
 
 
-def _draw_figures(summary: pd.DataFrame, output_dir: Path) -> None:
+def _draw_figures(summary: pd.DataFrame, output_dir: Path, prefix: str = "") -> None:
     import matplotlib.pyplot as plt
 
     at_64 = summary.loc[summary["gpus"].astype(str) == "64"]
@@ -136,7 +136,7 @@ def _draw_figures(summary: pd.DataFrame, output_dir: Path) -> None:
     axis.legend()
     axis.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(output_dir / "co2_saved_vs_k.png", dpi=160)
+    fig.savefig(output_dir / f"{prefix}co2_saved_vs_k.png", dpi=160)
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
@@ -158,7 +158,7 @@ def _draw_figures(summary: pd.DataFrame, output_dir: Path) -> None:
     axes[1].legend(fontsize="small")
     fig.suptitle("Carbon savings at 64 GPUs and unlimited capacity")
     fig.tight_layout()
-    fig.savefig(output_dir / "capacity_savings.png", dpi=160)
+    fig.savefig(output_dir / f"{prefix}capacity_savings.png", dpi=160)
     plt.close(fig)
 
 
@@ -221,6 +221,62 @@ def _zone_slug(zone: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", zone).strip("._") or "zone"
 
 
+def _capacity(value: str) -> int | None:
+    if value.lower() == "unlimited":
+        return None
+    try:
+        capacity = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("GPUs must be a positive integer or 'unlimited'") from exc
+    if capacity <= 0:
+        raise argparse.ArgumentTypeError("GPUs must be a positive integer or 'unlimited'")
+    return capacity
+
+
+def _scenario(
+    forecast_path: Path | None,
+    truth_path: Path | None,
+    zone: str | None,
+    policy: str,
+    k: int,
+    gpus: int | None,
+    align_jobs_year: bool,
+) -> None:
+    from reporting import RESULTS_DIR, save_scenario, trace_series
+
+    forecast_path = forecast_path or _single_data_file("forecasts*.csv", "forecast")
+    truth_path = truth_path or _single_data_file("grid_truth*.csv", "grid truth")
+    jobs = pd.read_csv(DATA_DIR / "jobs.csv")
+    truth = pd.read_csv(truth_path)
+    forecasts = pd.read_csv(forecast_path)
+    frames = _zone_frames(jobs, truth, forecasts)
+    if len(frames) > 1 and zone is None:
+        raise ValueError("Choose one grid zone with --zone")
+    matching = [frame for frame in frames if frame[0] == zone] if zone is not None else frames
+    if len(matching) != 1:
+        raise ValueError(f"Grid zone {zone!r} was not found in both traces")
+    selected_zone, zone_jobs, zone_truth, zone_forecasts = matching[0]
+    if align_jobs_year:
+        zone_jobs = _align_jobs_year(zone_jobs, zone_forecasts)
+    window = _simulation_window(zone_jobs, zone_forecasts, k)
+    if window is not None:
+        start, end, admission_end = window
+        zone_forecasts = _window_forecasts(zone_forecasts, start, end)
+    else:
+        start = end = admission_end = None
+    metrics, per_job = run_sim(
+        policy, k, gpus, zone_jobs, zone_truth, zone_forecasts,
+        start=start, end=end, admission_end=admission_end,
+    )
+    files = save_scenario(
+        metrics, per_job, trace_series(zone_truth, zone_forecasts),
+        policy, k, gpus, selected_zone,
+    )
+    print(f"Saved {len(per_job)} jobs to {RESULTS_DIR}")
+    for name in files.values():
+        print(f"  {name}")
+
+
 def _sweep(
     forecast_path: Path | None,
     figures: bool,
@@ -279,13 +335,16 @@ def _sweep(
                     if zone is not None:
                         filename = f"{_zone_slug(zone)}_{filename}"
                     per_job.to_csv(zone_per_job_dir / filename, index=False)
+                    per_job.to_csv(results_dir / filename, index=False)
         summaries.extend(zone_summaries)
         if zone is not None:
             zone_summary = pd.DataFrame(zone_summaries)
             zone_results.mkdir(parents=True, exist_ok=True)
             zone_summary.to_csv(zone_results / "summary.csv", index=False)
+            zone_summary.to_csv(results_dir / f"{_zone_slug(zone)}_summary.csv", index=False)
             if figures:
                 _draw_figures(zone_summary, zone_results)
+                _draw_figures(zone_summary, results_dir, prefix=f"{_zone_slug(zone)}_")
     summary = pd.DataFrame(summaries)
     results_dir.mkdir(parents=True, exist_ok=True)
     summary.to_csv(results_dir / "summary.csv", index=False)
@@ -302,15 +361,30 @@ def main() -> None:
     sweep.add_argument("--forecast", help="forecast CSV path (auto-detected if unique)")
     sweep.add_argument("--truth", help="grid truth CSV path (auto-detected if unique)")
     sweep.add_argument("--align-jobs-year", action="store_true", help="move job arrival year to the forecast year in memory")
-    sweep.add_argument("--figures", action="store_true", help="write CO2 comparison plots")
+    sweep.add_argument("--figures", action="store_true", default=True, help="write CO2 comparison plots (default)")
+    sweep.add_argument("--no-figures", dest="figures", action="store_false", help="skip comparison PNG plots")
+    scenario = commands.add_parser("scenario", help="run one scenario and save CSV and PNG outputs")
+    scenario.add_argument("--forecast", help="forecast CSV path (auto-detected if unique)")
+    scenario.add_argument("--truth", help="grid truth CSV path (auto-detected if unique)")
+    scenario.add_argument("--zone", help="grid zone; required for multi-zone traces")
+    scenario.add_argument("--policy", choices=POLICIES, default="forecast_greedy")
+    scenario.add_argument("--k", type=int, default=24, help="deferral window in hours")
+    scenario.add_argument("--gpus", type=_capacity, default=64, help="GPU capacity or unlimited")
+    scenario.add_argument("--align-jobs-year", action="store_true", help="move job arrival year to forecast year in memory")
     args = parser.parse_args()
     if args.command == "naive":
         output = make_naive_forecast(pd.read_csv(DATA_DIR / "grid_truth.csv"))
         print(f"Wrote {output}")
-    else:
+    elif args.command == "sweep":
         truth_path = _input_path(args.truth) if args.truth else None
         forecast_path = _input_path(args.forecast) if args.forecast else None
         _sweep(forecast_path, args.figures, truth_path, align_jobs_year=args.align_jobs_year)
+    else:
+        if args.k <= 0 or args.k > 168:
+            parser.error("--k must be between 1 and 168 hours")
+        truth_path = _input_path(args.truth) if args.truth else None
+        forecast_path = _input_path(args.forecast) if args.forecast else None
+        _scenario(forecast_path, truth_path, args.zone, args.policy, args.k, args.gpus, args.align_jobs_year)
 
 
 if __name__ == "__main__":
