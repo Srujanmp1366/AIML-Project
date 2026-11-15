@@ -1,6 +1,21 @@
-.venv/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-data/
-results/
+# Node / frontend
+node_modules/
+dist/
+
+# Secrets (Electricity Maps token)
+.env
+*.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Data: keep the sample jobs file, ignore the rest
+data/*
+!data/jobs.csv
+
+# Generated outputs: keep only the main summary
+results/*
+!results/summary.csv

@@ -1,69 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
+import { parseCsv, toSummaryRows, toJobRows, jobFileName, type CompareRow, type JobRow, type Metrics, type Policy } from './results'
 
-type Policy = 'run_now' | 'threshold' | 'forecast_greedy' | 'oracle'
 type View = 'overview' | 'jobs' | 'compare'
-type UploadKey = 'jobs' | 'grid_truth' | 'forecasts'
-type UploadFiles = Record<UploadKey, File | null>
-interface Metrics {
-  total_kwh: number | null
-  emissions_avg_kg: number | null
-  emissions_marg_kg: number | null
-  total_jobs: number | null
-  completed_jobs: number | null
-  unfinished_jobs: number | null
-  deadline_misses: number | null
-  deadline_observed_jobs: number | null
-  mean_added_delay_hours: number | null
-  p95_added_delay_hours: number | null
-  gpu_utilisation: number | null
-  run_now_avg_kg: number | null
-  percent_saved_vs_run_now_avg_pct: number | null
-  greedy_perfect_ci_avg_kg: number | null
-}
-
-interface Config {
-  policies: Policy[]
-  k_values: number[]
-  capacities: Array<number | null>
-  forecasts: string[]
-  truths: string[]
-  truth_zones: Record<string, string[]>
-  local_ready: boolean
-}
-
-interface JobRow {
-  job_id: string
-  arrival: string | null
-  start_time: string | null
-  finish_time: string | null
-  deadline: string | null
-  deferrable: boolean
-  deadline_observed: boolean
-  deadline_missed: boolean
-  infeasible_on_arrival: boolean
-  start_wait_hours: number | null
-  added_delay_hours: number | null
-  busy_gpu_hours: number | null
-}
-
-interface TracePoint {
-  time: string
-  actual_ci: number
-  predicted_ci: number
-}
-
-interface SimulationResult {
-  metrics: Metrics
-  jobs: JobRow[]
-  trace: TracePoint[]
-  files: Record<string, string>
-}
-
-interface CompareRow extends Metrics {
-  policy: Policy
-  k: number
-  gpus: string
-}
 
 const POLICIES: Array<{ id: Policy; name: string; description: string }> = [
   { id: 'forecast_greedy', name: 'Forecast greedy', description: 'Schedule work in lower-carbon forecast hours.' },
@@ -71,12 +9,11 @@ const POLICIES: Array<{ id: Policy; name: string; description: string }> = [
   { id: 'run_now', name: 'Run now', description: 'Start eligible jobs as capacity allows.' },
   { id: 'oracle', name: 'Perfect CI', description: 'Greedy policy with future actual intensity.' },
 ]
+const COMPARE_ORDER: Policy[] = ['run_now', 'threshold', 'forecast_greedy', 'oracle']
 
 const POLICY_NAME: Record<Policy, string> = Object.fromEntries(
   POLICIES.map(({ id, name }) => [id, name]),
 ) as Record<Policy, string>
-
-const initialUploads: UploadFiles = { jobs: null, grid_truth: null, forecasts: null }
 
 function number(value: number | null | undefined, digits = 1): string {
   return value == null || !Number.isFinite(value)
@@ -86,21 +23,16 @@ function number(value: number | null | undefined, digits = 1): string {
 
 function date(value: string | null): string {
   if (!value) return '—'
-  const parsed = new Date(value)
+  const parsed = new Date(value.replace(' ', 'T'))
   return Number.isNaN(parsed.getTime())
     ? value
     : parsed.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
-async function request<T>(path: string, payload?: object): Promise<T> {
-  const response = await fetch(path, payload ? {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  } : undefined)
-  const body = await response.json()
-  if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`)
-  return body as T
+async function fetchCsv(name: string): Promise<string> {
+  const response = await fetch(`/api/results/${encodeURIComponent(name)}`, { cache: 'no-store' })
+  if (!response.ok) throw new Error(`${name} not found in results/ (HTTP ${response.status})`)
+  return response.text()
 }
 
 function BrandMark() {
@@ -151,36 +83,6 @@ function SavedFiles({ files }: { files: Record<string, string> }) {
   return <div className="panel output-panel"><div><span className="section-index">SAVED OUTPUT</span><h3>CSV tables and PNG graphs</h3><p>Saved in carbon-scheduler/results/</p></div><div className="output-links">{Object.entries(files).map(([kind, name]) => <a key={kind} href={`/api/results/${encodeURIComponent(name)}`} download>{kind.replace(/_/g, ' ')} <span>{name}</span></a>)}</div></div>
 }
 
-function TraceChart({ points }: { points: TracePoint[] }) {
-  const valid = points.filter((point) => Number.isFinite(point.actual_ci) && Number.isFinite(point.predicted_ci) && Number.isFinite(Date.parse(point.time)))
-  if (!valid.length) return <p className="graph-empty">No matching actual and forecast hours are available.</p>
-  const width = 640; const height = 250
-  const left = 52; const right = 18; const top = 34; const bottom = 42
-  const plotWidth = width - left - right; const plotHeight = height - top - bottom
-  const times = valid.map((point) => Date.parse(point.time))
-  const first = times[0]; const span = Math.max(1, times[times.length - 1] - first)
-  const values = valid.flatMap((point) => [point.actual_ci, point.predicted_ci])
-  const low = Math.floor(Math.min(...values) / 50) * 50
-  const high = Math.max(low + 50, Math.ceil(Math.max(...values) / 50) * 50)
-  const x = (time: number) => left + ((time - first) / span) * plotWidth
-  const y = (value: number) => top + ((high - value) / (high - low)) * plotHeight
-  const path = (field: 'actual_ci' | 'predicted_ci') => valid.map((point, index) => `${index ? 'L' : 'M'} ${x(times[index]).toFixed(1)} ${y(point[field]).toFixed(1)}`).join(' ')
-  const dateLabel = (time: number) => new Date(time).toLocaleString('en-GB', { timeZone: 'UTC', month: 'short', day: 'numeric', hour: '2-digit' })
-  return <>
-    <svg id="carbon-intensity-graph" className="graph-svg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Hourly actual and one-hour-ahead forecast carbon intensity">
-      <rect width={width} height={height} fill="white" />
-      <line x1={left} x2={left + 16} y1="14" y2="14" stroke="#279b5e" strokeWidth="3" /><text x={left + 22} y="18" fill="#48654f" fontSize="11">Actual CI</text>
-      <line x1={left + 110} x2={left + 126} y1="14" y2="14" stroke="#7195cf" strokeWidth="3" strokeDasharray="5 4" /><text x={left + 132} y="18" fill="#48654f" fontSize="11">One-hour forecast</text>
-      <text x={width - right} y="18" textAnchor="end" fill="#748b79" fontSize="11">gCO₂/kWh</text>
-      {[0, 1, 2, 3, 4].map((tick) => { const value = low + (high - low) * tick / 4; return <g key={tick}><line x1={left} x2={width - right} y1={y(value)} y2={y(value)} stroke="#e4ebe4" /><text x={left - 9} y={y(value) + 4} textAnchor="end" fill="#748b79" fontSize="11">{number(value, 0)}</text></g> })}
-      {[0, 0.5, 1].map((fraction) => <text key={fraction} x={left + fraction * plotWidth} y={height - 12} textAnchor={fraction === 0 ? 'start' : fraction === 1 ? 'end' : 'middle'} fill="#748b79" fontSize="11">{dateLabel(first + span * fraction)}</text>)}
-      <path d={path('actual_ci')} fill="none" stroke="#279b5e" strokeWidth="2.5" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
-      <path d={path('predicted_ci')} fill="none" stroke="#7195cf" strokeWidth="2" strokeLinejoin="round" strokeDasharray="5 4" vectorEffect="non-scaling-stroke" />
-    </svg>
-    <div className="graph-legend"><span><i className="legend-actual" />Actual CI</span><span><i className="legend-forecast" />One-hour-ahead forecast</span><span>gCO₂/kWh · UTC</span></div>
-  </>
-}
-
 function WaitChart({ jobs }: { jobs: JobRow[] }) {
   const waits = jobs.map((job) => job.start_wait_hours).filter((value): value is number => value != null && Number.isFinite(value) && value >= 0)
   if (!waits.length) return <p className="graph-empty">No job start waits are available.</p>
@@ -207,113 +109,100 @@ function WaitChart({ jobs }: { jobs: JobRow[] }) {
   </>
 }
 
+function SavingsChart({ rows, ks }: { rows: CompareRow[]; ks: number[] }) {
+  const lines: Array<{ policy: Policy; color: string; dash?: string }> = [
+    { policy: 'forecast_greedy', color: '#279b5e' },
+    { policy: 'threshold', color: '#c8923a' },
+    { policy: 'oracle', color: '#7195cf', dash: '5 4' },
+  ]
+  const points = lines.map((line) => ({
+    ...line,
+    values: ks.map((k) => rows.find((row) => row.policy === line.policy && row.k === k)?.percent_saved_vs_run_now_avg_pct ?? null),
+  }))
+  const all = points.flatMap((line) => line.values).filter((value): value is number => value != null && Number.isFinite(value))
+  if (!all.length || ks.length < 2) return <p className="graph-empty">No comparable savings values for this zone and capacity.</p>
+  const width = 640; const height = 250
+  const left = 52; const right = 18; const top = 34; const bottom = 42
+  const plotWidth = width - left - right; const plotHeight = height - top - bottom
+  const low = Math.min(0, Math.floor(Math.min(...all) / 5) * 5)
+  const high = Math.max(low + 5, Math.ceil(Math.max(...all) / 5) * 5)
+  const x = (index: number) => left + (index / (ks.length - 1)) * plotWidth
+  const y = (value: number) => top + ((high - value) / (high - low)) * plotHeight
+  return <>
+    <svg className="graph-svg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Percent carbon saved versus deferral window">
+      <rect width={width} height={height} fill="white" />
+      <text x={width - right} y="18" textAnchor="end" fill="#748b79" fontSize="11">% saved vs run now</text>
+      {[0, 1, 2, 3, 4].map((tick) => { const value = low + (high - low) * tick / 4; return <g key={tick}><line x1={left} x2={width - right} y1={y(value)} y2={y(value)} stroke="#e4ebe4" /><text x={left - 9} y={y(value) + 4} textAnchor="end" fill="#748b79" fontSize="11">{number(value, 0)}</text></g> })}
+      {ks.map((k, index) => <text key={k} x={x(index)} y={height - 12} textAnchor="middle" fill="#748b79" fontSize="11">{k}h</text>)}
+      {points.map((line) => {
+        const segments = line.values.map((value, index) => value == null || !Number.isFinite(value) ? null : { cx: x(index), cy: y(value) })
+        const path = segments.map((point, index) => point ? `${segments.slice(0, index).some(Boolean) ? 'L' : 'M'} ${point.cx.toFixed(1)} ${point.cy.toFixed(1)}` : '').join(' ')
+        return <g key={line.policy}><path d={path} fill="none" stroke={line.color} strokeWidth="2.5" strokeDasharray={line.dash} strokeLinejoin="round" />{segments.map((point, index) => point && <circle key={index} cx={point.cx} cy={point.cy} r="3.5" fill={line.color} />)}</g>
+      })}
+    </svg>
+    <div className="graph-legend">{lines.map((line) => <span key={line.policy}><i style={{ background: line.color }} />{POLICY_NAME[line.policy]}</span>)}<span>x-axis: deferral window k</span></div>
+  </>
+}
+
 function App() {
-  const [config, setConfig] = useState<Config | null>(null)
+  const [summary, setSummary] = useState<CompareRow[] | null>(null)
   const [view, setView] = useState<View>('overview')
-  const [source, setSource] = useState<'local' | 'upload'>('local')
-  const [forecastFile, setForecastFile] = useState('')
-  const [truthFile, setTruthFile] = useState('')
   const [zone, setZone] = useState('')
-  const [uploadZone, setUploadZone] = useState('')
-  const [alignJobsYear, setAlignJobsYear] = useState(false)
-  const [uploads, setUploads] = useState<UploadFiles>(initialUploads)
   const [policy, setPolicy] = useState<Policy>('forecast_greedy')
   const [k, setK] = useState(24)
   const [capacity, setCapacity] = useState('64')
-  const [result, setResult] = useState<SimulationResult | null>(null)
-  const [resultPolicy, setResultPolicy] = useState<Policy>('forecast_greedy')
-  const [comparison, setComparison] = useState<CompareRow[] | null>(null)
-  const [comparisonFiles, setComparisonFiles] = useState<Record<string, string> | null>(null)
-  const [loading, setLoading] = useState<'simulate' | 'compare' | null>(null)
+  const [jobs, setJobs] = useState<JobRow[] | null>(null)
+  const [jobsError, setJobsError] = useState('')
   const [error, setError] = useState('')
   const [search, setSearch] = useState('')
   const [jobFilter, setJobFilter] = useState<'all' | 'missed' | 'unfinished'>('all')
   const [shownJobs, setShownJobs] = useState(12)
 
   useEffect(() => {
-    request<Config>('/api/config')
-      .then((data) => {
-        setConfig(data)
-        setForecastFile(data.forecasts[0] || '')
-        setTruthFile(data.truths[0] || '')
-        setZone(data.truth_zones[data.truths[0]]?.[0] || '')
+    fetchCsv('summary.csv')
+      .then((text) => {
+        const rows = toSummaryRows(parseCsv(text))
+        if (!rows.length) throw new Error('summary.csv has no runs. Run: python run.py sweep ...')
+        setSummary(rows)
+        const first = rows[0]
+        setZone(first.zone)
+        setK(rows.some((row) => row.k === 24) ? 24 : first.k)
+        setCapacity(rows.some((row) => row.gpus === '64') ? '64' : first.gpus)
       })
-      .catch((err: Error) => setError(`Cannot reach the Python API: ${err.message}`))
+      .catch((err: Error) => setError(`Cannot load results/summary.csv: ${err.message}. Start python api.py from carbon-scheduler/ after running the sweep.`))
   }, [])
 
+  const zones = useMemo(() => [...new Set((summary || []).map((row) => row.zone))].filter(Boolean).sort(), [summary])
+  const ks = useMemo(() => [...new Set((summary || []).map((row) => row.k))].sort((a, b) => a - b), [summary])
+  const capacities = useMemo(() => [...new Set((summary || []).map((row) => row.gpus))].sort((a, b) => (a === 'unlimited' ? 1 : b === 'unlimited' ? -1 : Number(a) - Number(b))), [summary])
+
+  const selected = useMemo(() => (summary || []).find((row) => row.zone === zone && row.policy === policy && row.k === k && row.gpus === capacity) || null, [summary, zone, policy, k, capacity])
+  const comparison = useMemo(() => COMPARE_ORDER.map((id) => (summary || []).find((row) => row.zone === zone && row.policy === id && row.k === k && row.gpus === capacity)).filter((row): row is CompareRow => Boolean(row)), [summary, zone, k, capacity])
+  const zoneCapacityRows = useMemo(() => (summary || []).filter((row) => row.zone === zone && row.gpus === capacity), [summary, zone, capacity])
+
+  const jobFile = selected ? jobFileName(selected) : ''
   useEffect(() => {
-    setResult(null)
-    setComparison(null)
-    setComparisonFiles(null)
-  }, [source, forecastFile, truthFile, zone, uploadZone, alignJobsYear, uploads, policy, k, capacity])
+    setJobs(null); setJobsError(''); setSearch(''); setJobFilter('all'); setShownJobs(12)
+    if (!jobFile) return
+    let cancelled = false
+    fetchCsv(jobFile)
+      .then((text) => { if (!cancelled) setJobs(toJobRows(parseCsv(text))) })
+      .catch((err: Error) => { if (!cancelled) setJobsError(err.message) })
+    return () => { cancelled = true }
+  }, [jobFile])
 
-  const ready = source === 'local'
-    ? Boolean(config?.local_ready && forecastFile && truthFile)
-    : Boolean(uploads.jobs && uploads.grid_truth && uploads.forecasts)
-
-  async function payload() {
-    const common = {
-      source,
-      policy,
-      k,
-      gpus: capacity === 'unlimited' ? null : Number(capacity),
-      zone: source === 'local' ? zone || null : uploadZone.trim() || null,
-      align_jobs_year: alignJobsYear,
-    }
-    if (source === 'local') return { ...common, truth_file: truthFile, forecast_file: forecastFile }
-    if (!uploads.jobs || !uploads.grid_truth || !uploads.forecasts) {
-      throw new Error('Choose all three CSV files first')
-    }
-    const [jobs, grid_truth, forecasts] = await Promise.all([
-      uploads.jobs.text(), uploads.grid_truth.text(), uploads.forecasts.text(),
-    ])
-    return { ...common, uploads: { jobs, grid_truth, forecasts } }
-  }
-
-  async function simulate() {
-    if (!ready || loading) return
-    setLoading('simulate')
-    setError('')
-    try {
-      const data = await request<SimulationResult>('/api/simulate', await payload())
-      setResult(data)
-      setResultPolicy(policy)
-      setComparison(null)
-      setComparisonFiles(null)
-      setView('overview')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Simulation failed')
-    } finally {
-      setLoading(null)
-    }
-  }
-
-  async function compare() {
-    if (!ready || loading) return
-    setLoading('compare')
-    setError('')
-    try {
-      const data = await request<{ rows: CompareRow[]; files: Record<string, string> }>('/api/compare', await payload())
-      setComparison(data.rows)
-      setComparisonFiles(data.files)
-      setView('compare')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Comparison failed')
-    } finally {
-      setLoading(null)
-    }
-  }
-
-  const filteredJobs = useMemo(() => (result?.jobs || []).filter((job) => {
+  const filteredJobs = useMemo(() => (jobs || []).filter((job) => {
     if (search && !job.job_id.toLowerCase().includes(search.toLowerCase())) return false
     if (jobFilter === 'missed' && !job.deadline_missed) return false
     if (jobFilter === 'unfinished' && job.finish_time) return false
     return true
-  }), [result, search, jobFilter])
+  }), [jobs, search, jobFilter])
 
-  const metrics = result?.metrics
+  const metrics: Metrics | null = selected
   const saving = metrics?.percent_saved_vs_run_now_avg_pct
-  const comparisonMax = Math.max(1, ...(comparison || []).map((row) => row.emissions_avg_kg || 0))
+  const comparisonMax = Math.max(1, ...comparison.map((row) => row.emissions_avg_kg || 0))
+  const files: Record<string, string> = selected ? { summary: 'summary.csv', per_job: jobFile } : {}
+  const loaded = Boolean(summary)
 
   return (
     <div className="app-shell">
@@ -326,16 +215,16 @@ function App() {
           <button className={view === 'compare' ? 'active' : ''} onClick={() => setView('compare')}><span className="nav-glyph">▥</span> Compare policies</button>
         </nav>
         <div className="sidebar-bottom">
-          <div className="side-info"><span className="pulse" /> SIMULATION ENGINE<br /><strong>{config ? 'API connected' : 'Waiting for API'}</strong></div>
+          <div className="side-info"><span className="pulse" /> RESULTS FILES<br /><strong>{loaded ? `${summary?.length} runs loaded` : 'Waiting for results'}</strong></div>
           <p>Explore the carbon impact of when training jobs run.</p>
-          <div className="side-version">TRACE-DRIVEN RESEARCH TOOL <span>v1.0</span></div>
+          <div className="side-version">TRACE-DRIVEN RESEARCH TOOL <span>v2.0</span></div>
         </div>
       </aside>
 
       <main className="main-content">
         <header className="topbar">
           <div className="breadcrumb">Workspace <span>/</span> Carbon scheduler <span>/</span> <strong>{view === 'overview' ? 'Overview' : view === 'jobs' ? 'Job explorer' : 'Compare policies'}</strong></div>
-          <div className={`connection-pill ${config ? 'online' : ''}`}><span /> {config ? 'Python API connected' : 'API offline'}</div>
+          <div className={`connection-pill ${loaded ? 'online' : ''}`}><span /> {loaded ? 'Reading saved sweep results' : 'Results not loaded'}</div>
         </header>
 
         <div className="content-wrap">
@@ -352,68 +241,34 @@ function App() {
             </div>
           </section>
 
-          {error && <div className="error-banner" role="alert"><strong>Could not complete request.</strong> {error}</div>}
+          {error && <div className="error-banner" role="alert"><strong>Could not load results.</strong> {error}</div>}
 
-          <section className="section-heading"><div><span className="section-index">01 / CONFIGURE</span><h2>Simulation setup</h2></div><p>Choose a trace, policy, and available GPU capacity.</p></section>
+          <section className="section-heading"><div><span className="section-index">01 / SELECT</span><h2>Choose a sweep result</h2></div><p>Every combination below comes from the saved sweep. Nothing is re-simulated.</p></section>
           <div className="setup-grid">
             <div className="panel data-panel">
-              <div className="panel-top"><div className="panel-icon">↗</div><div><h3>Input data</h3><p>Use your local traces or upload CSVs from your computer.</p></div></div>
-              <div className="segmented" role="group" aria-label="Data source">
-                <button className={source === 'local' ? 'selected' : ''} onClick={() => setSource('local')}>Local data folder</button>
-                <button className={source === 'upload' ? 'selected' : ''} onClick={() => setSource('upload')}>Upload CSV files</button>
+              <div className="panel-top"><div className="panel-icon">↗</div><div><h3>Saved results</h3><p>Read from results/summary.csv and the per-job CSV files.</p></div></div>
+              <div className="local-data-fields">
+                {zones.length > 0 && <div className="field-group">
+                  <label htmlFor="zone">Grid zone</label>
+                  <select id="zone" value={zone} onChange={(event) => setZone(event.target.value)}>{zones.map((name) => <option key={name} value={name}>{name}</option>)}</select>
+                </div>}
+                <div className={`data-status ${loaded ? 'good' : 'warn'}`}><span />{loaded ? `${summary?.length} runs found in summary.csv` : 'Run the sweep to create results/summary.csv'}</div>
               </div>
-              {source === 'local' ? (
-                <div className="local-data-fields">
-                  <div className="field-group">
-                    <label htmlFor="truth">Grid truth trace</label>
-                    <select id="truth" value={truthFile} onChange={(event) => { const name = event.target.value; setTruthFile(name); setZone(config?.truth_zones[name]?.[0] || '') }}>
-                      {config?.truths.length ? config.truths.map((name) => <option key={name} value={name}>{name}</option>) : <option value="">No grid truth CSV found</option>}
-                    </select>
-                  </div>
-                  <div className="field-group">
-                    <label htmlFor="forecast">Forecast trace</label>
-                    <select id="forecast" value={forecastFile} onChange={(event) => setForecastFile(event.target.value)}>
-                      {config?.forecasts.length ? config.forecasts.map((name) => <option key={name} value={name}>{name}</option>) : <option value="">No forecast CSV found</option>}
-                    </select>
-                  </div>
-                  {Boolean(config?.truth_zones[truthFile]?.length) && <div className="field-group">
-                    <label htmlFor="zone">Grid zone</label>
-                    <select id="zone" value={zone} onChange={(event) => setZone(event.target.value)}>
-                      {config?.truth_zones[truthFile]?.map((name) => <option key={name} value={name}>{name}</option>)}
-                    </select>
-                  </div>}
-                  <div className={`data-status ${config?.local_ready ? 'good' : 'warn'}`}><span />{config?.local_ready ? 'Jobs, grid truth, and forecast traces found in data/' : 'Add jobs, grid truth, and forecast CSVs to data/'}</div>
-                </div>
-              ) : (
-                <div className="upload-list">
-                  {(['jobs', 'grid_truth', 'forecasts'] as UploadKey[]).map((key) => (
-                    <label className="upload-row" key={key}>
-                      <span><strong>{key === 'grid_truth' ? 'Grid truth' : key === 'jobs' ? 'Jobs' : 'Forecasts'}</strong><small>{uploads[key]?.name || `${key}.csv`}</small></span>
-                      <span className="upload-action">{uploads[key] ? 'Change' : 'Choose file'}</span>
-                      <input type="file" accept=".csv,text/csv" onChange={(event) => setUploads((current) => ({ ...current, [key]: event.target.files?.[0] || null }))} />
-                    </label>
-                  ))}
-                  <div className="field-group"><label htmlFor="upload-zone">Grid zone (for multi-zone uploads)</label><input id="upload-zone" value={uploadZone} onChange={(event) => setUploadZone(event.target.value)} placeholder="For example, IN-EA" /></div>
-                  <p className="field-hint">Uploads are processed in memory and are not saved by the API.</p>
-                </div>
-              )}
-              <label className="align-option"><input type="checkbox" checked={alignJobsYear} onChange={(event) => setAlignJobsYear(event.target.checked)} /><span>Align job arrival year to forecast year in memory<small>Use this when job dates and trace dates differ. The jobs CSV is not changed.</small></span></label>
             </div>
 
             <div className="panel scenario-panel">
               <div className="panel-top"><div className="panel-icon accent">◷</div><div><h3>Scenario</h3><p>Pick the scheduling rule and its operating limits.</p></div></div>
               <div className="scenario-fields">
                 <div className="field-group policy-field"><label htmlFor="policy">Scheduling policy</label><select id="policy" value={policy} onChange={(event) => setPolicy(event.target.value as Policy)}>{POLICIES.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><span className="field-hint">{POLICIES.find((item) => item.id === policy)?.description}</span></div>
-                <div className="field-group"><label htmlFor="window">Deferral window</label><select id="window" value={k} onChange={(event) => setK(Number(event.target.value))}>{(config?.k_values || [6, 12, 24, 48]).map((value) => <option key={value} value={value}>{value} hours</option>)}</select></div>
-                <div className="field-group"><label htmlFor="capacity">GPU capacity</label><select id="capacity" value={capacity} onChange={(event) => setCapacity(event.target.value)}>{(config?.capacities || [64, 32, 128, null]).map((value) => <option key={value ?? 'unlimited'} value={value ?? 'unlimited'}>{value == null ? 'Unlimited' : `${value} GPUs`}</option>)}</select></div>
+                <div className="field-group"><label htmlFor="window">Deferral window</label><select id="window" value={k} onChange={(event) => setK(Number(event.target.value))}>{ks.map((value) => <option key={value} value={value}>{value} hours</option>)}</select></div>
+                <div className="field-group"><label htmlFor="capacity">GPU capacity</label><select id="capacity" value={capacity} onChange={(event) => setCapacity(event.target.value)}>{capacities.map((value) => <option key={value} value={value}>{value === 'unlimited' ? 'Unlimited' : `${value} GPUs`}</option>)}</select></div>
               </div>
-              <div className="scenario-actions"><button className="primary-button" disabled={!ready || Boolean(loading)} onClick={simulate}>{loading === 'simulate' ? 'Running simulation…' : 'Run simulation'} <span>→</span></button><button className="secondary-button" disabled={!ready || Boolean(loading)} onClick={compare}>{loading === 'compare' ? 'Comparing…' : 'Compare all policies'}</button></div>
             </div>
           </div>
 
           {view === 'overview' && <>
-            <section className="section-heading results-heading"><div><span className="section-index">02 / ANALYZE</span><h2>Simulation results</h2></div><p>{result ? `${POLICY_NAME[resultPolicy]} · ${number(metrics?.total_jobs, 0)} jobs analyzed` : 'Results appear after you run a scenario.'}</p></section>
-            {result && metrics ? <>
+            <section className="section-heading results-heading"><div><span className="section-index">02 / ANALYZE</span><h2>Simulation results</h2></div><p>{selected ? `${POLICY_NAME[policy]} · ${zone ? `${zone} · ` : ''}${number(metrics?.total_jobs, 0)} jobs analyzed` : 'Pick a combination above.'}</p></section>
+            {selected && metrics ? <>
               <div className="metrics-grid">
                 <MetricCard label="Average emissions" value={number(metrics.emissions_avg_kg)} unit="kg CO₂" note="Actual carbon intensity" tone="metric-featured" />
                 <MetricCard label="Saved vs. run now" value={number(saving)} unit="%" note={saving == null ? 'Requires completed runs' : saving >= 0 ? 'Lower emissions than baseline' : 'Higher emissions than baseline'} tone={saving != null && saving < 0 ? 'metric-negative' : ''} />
@@ -421,30 +276,29 @@ function App() {
                 <MetricCard label="Deadline misses" value={number(metrics.deadline_misses, 0)} unit="jobs" note={`${number(metrics.deadline_observed_jobs, 0)} observed deadlines`} />
               </div>
               <div className="analysis-grid">
-                <div className="panel chart-panel"><div className="panel-header"><div><span className="section-index">EMISSIONS</span><h3>Carbon comparison</h3></div><span className="panel-badge">Actual CI · kg CO₂</span></div><EmissionsChart metrics={metrics} policy={resultPolicy} /><p className="chart-caption">Perfect CI greedy is a foresight benchmark, not a globally optimal schedule.</p></div>
-                <div className="panel detail-panel"><div className="panel-header"><div><span className="section-index">OPERATIONS</span><h3>Workload outcomes</h3></div></div><div className="detail-list"><div><span>Mean added delay</span><strong>{number(metrics.mean_added_delay_hours)} h</strong></div><div><span>95th percentile delay</span><strong>{number(metrics.p95_added_delay_hours)} h</strong></div><div><span>GPU utilisation</span><strong>{metrics.gpu_utilisation == null ? '—' : `${number(metrics.gpu_utilisation * 100)}%`}</strong></div><div><span>Total energy</span><strong>{number(metrics.total_kwh)} kWh</strong></div><div><span>Marginal emissions</span><strong>{number(metrics.emissions_marg_kg)} kg</strong></div></div></div>
+                <div className="panel chart-panel"><div className="panel-header"><div><span className="section-index">EMISSIONS</span><h3>Carbon comparison</h3></div><span className="panel-badge">Actual CI · kg CO₂</span></div><EmissionsChart metrics={metrics} policy={policy} /><p className="chart-caption">Perfect CI greedy is a foresight benchmark, not a globally optimal schedule.</p></div>
+                <div className="panel detail-panel"><div className="panel-header"><div><span className="section-index">OPERATIONS</span><h3>Workload outcomes</h3></div></div><div className="detail-list"><div><span>Mean added delay</span><strong>{number(metrics.mean_added_delay_hours)} h</strong></div><div><span>95th percentile delay</span><strong>{number(metrics.p95_added_delay_hours)} h</strong></div><div><span>GPU utilisation</span><strong>{metrics.gpu_utilisation == null ? '—' : `${number(metrics.gpu_utilisation * 100)}%`}</strong></div><div><span>Total energy</span><strong>{number(metrics.total_kwh)} kWh</strong></div><div><span>Gap to perfect-CI greedy</span><strong>{number(metrics.gap_to_oracle_avg_kg)} kg</strong></div></div></div>
               </div>
               <div className="graphs-grid">
-                <div className="panel graph-panel"><div className="panel-header"><div><span className="section-index">GRID SIGNAL</span><h3>Carbon intensity over time</h3></div><a className="graph-export" href={`/api/results/${encodeURIComponent(result.files.carbon_intensity)}`} download>Download PNG</a></div><TraceChart points={result.trace} /><p className="chart-caption">The forecast shown for each hour was issued one hour earlier. Values are sampled when the period exceeds 240 hours.</p></div>
-                <div className="panel graph-panel"><div className="panel-header"><div><span className="section-index">JOB DELAY</span><h3>Start wait distribution</h3></div><a className="graph-export" href={`/api/results/${encodeURIComponent(result.files.start_waits)}`} download>Download PNG</a></div><WaitChart jobs={result.jobs} /><p className="chart-caption">Counts include jobs that started; jobs without a start time are excluded.</p></div>
+                <div className="panel graph-panel"><div className="panel-header"><div><span className="section-index">DEFERRAL WINDOW</span><h3>Carbon saved vs. k</h3></div></div><SavingsChart rows={zoneCapacityRows} ks={ks} /><p className="chart-caption">Same zone and GPU capacity as selected. Gaps appear where a run left jobs unfinished.</p></div>
+                <div className="panel graph-panel"><div className="panel-header"><div><span className="section-index">JOB DELAY</span><h3>Start wait distribution</h3></div></div>{jobs ? <WaitChart jobs={jobs} /> : <p className="graph-empty">{jobsError || 'Loading per-job file…'}</p>}<p className="chart-caption">Counts include jobs that started; jobs without a start time are excluded.</p></div>
               </div>
-              <SavedFiles files={result.files} />
+              <SavedFiles files={files} />
               <div className="next-action"><div><strong>See what happened to each job</strong><p>Inspect arrival, start, finish, wait time, and deadline outcomes.</p></div><button onClick={() => setView('jobs')}>Open job explorer <span>→</span></button></div>
-            </> : <div className="empty-panel"><div className="empty-symbol">↗</div><h3>Your results will appear here</h3><p>{ready ? 'Run a simulation to see emissions, job outcomes, and GPU utilisation.' : 'Add the required CSV inputs above, then run a simulation.'}</p></div>}
+            </> : <div className="empty-panel"><div className="empty-symbol">↗</div><h3>No result for this combination</h3><p>{loaded ? 'This zone, policy, k and capacity are not in summary.csv.' : 'Run the sweep and start python api.py, then reload this page.'}</p></div>}
           </>}
 
           {view === 'jobs' && <>
-            <section className="section-heading results-heading"><div><span className="section-index">02 / EXPLORE</span><h2>Job explorer</h2></div><p>Follow each job from arrival to completion.</p></section>
-            {result ? <div className="panel jobs-panel"><div className="table-toolbar"><div><h3>Per-job outcomes</h3><p>{filteredJobs.length} of {result.jobs.length} jobs</p></div><div className="table-controls"><input aria-label="Search job ID" placeholder="Search job ID…" value={search} onChange={(event) => { setSearch(event.target.value); setShownJobs(12) }} /><select aria-label="Filter jobs" value={jobFilter} onChange={(event) => { setJobFilter(event.target.value as typeof jobFilter); setShownJobs(12) }}><option value="all">All jobs</option><option value="missed">Deadline missed</option><option value="unfinished">Unfinished</option></select></div></div><div className="table-scroll"><table><thead><tr><th>Job ID</th><th>Arrival</th><th>Start</th><th>Finish</th><th>Wait</th><th>GPU hours</th><th>Status</th></tr></thead><tbody>{filteredJobs.slice(0, shownJobs).map((job) => <tr key={job.job_id}><td className="mono strong">{job.job_id}</td><td>{date(job.arrival)}</td><td>{date(job.start_time)}</td><td>{date(job.finish_time)}</td><td>{number(job.start_wait_hours)} h</td><td>{number(job.busy_gpu_hours)}</td><td><span className={`status-tag ${job.deadline_missed ? 'bad' : !job.finish_time ? 'waiting' : 'good'}`}>{job.deadline_missed ? 'Missed' : !job.finish_time ? 'Unfinished' : 'Completed'}</span></td></tr>)}</tbody></table>{filteredJobs.length === 0 && <div className="table-empty">No jobs match your filter.</div>}</div>{filteredJobs.length > shownJobs && <button className="load-more" onClick={() => setShownJobs((count) => count + 24)}>Show more jobs ↓</button>}</div> : <div className="empty-panel"><div className="empty-symbol">≡</div><h3>No job results yet</h3><p>Run a simulation to inspect per-job timing and outcomes.</p><button className="secondary-button" onClick={() => setView('overview')}>Back to overview</button></div>}
+            <section className="section-heading results-heading"><div><span className="section-index">02 / EXPLORE</span><h2>Job explorer</h2></div><p>{jobFile ? `Loaded from ${jobFile}` : 'Follow each job from arrival to completion.'}</p></section>
+            {jobs ? <div className="panel jobs-panel"><div className="table-toolbar"><div><h3>Per-job outcomes</h3><p>{filteredJobs.length} of {jobs.length} jobs</p></div><div className="table-controls"><input aria-label="Search job ID" placeholder="Search job ID…" value={search} onChange={(event) => { setSearch(event.target.value); setShownJobs(12) }} /><select aria-label="Filter jobs" value={jobFilter} onChange={(event) => { setJobFilter(event.target.value as typeof jobFilter); setShownJobs(12) }}><option value="all">All jobs</option><option value="missed">Deadline missed</option><option value="unfinished">Unfinished</option></select></div></div><div className="table-scroll"><table><thead><tr><th>Job ID</th><th>Arrival</th><th>Start</th><th>Finish</th><th>Wait</th><th>GPU hours</th><th>Status</th></tr></thead><tbody>{filteredJobs.slice(0, shownJobs).map((job) => <tr key={job.job_id}><td className="mono strong">{job.job_id}</td><td>{date(job.arrival)}</td><td>{date(job.start_time)}</td><td>{date(job.finish_time)}</td><td>{number(job.start_wait_hours)} h</td><td>{number(job.busy_gpu_hours)}</td><td><span className={`status-tag ${job.deadline_missed ? 'bad' : !job.finish_time ? 'waiting' : 'good'}`}>{job.deadline_missed ? 'Missed' : !job.finish_time ? 'Unfinished' : 'Completed'}</span></td></tr>)}</tbody></table>{filteredJobs.length === 0 && <div className="table-empty">No jobs match your filter.</div>}</div>{filteredJobs.length > shownJobs && <button className="load-more" onClick={() => setShownJobs((count) => count + 24)}>Show more jobs ↓</button>}</div> : <div className="empty-panel"><div className="empty-symbol">≡</div><h3>{jobsError ? 'Per-job file not found' : 'No job results yet'}</h3><p>{jobsError || 'Select a zone, policy, k and capacity above.'}</p><button className="secondary-button" onClick={() => setView('overview')}>Back to overview</button></div>}
           </>}
 
           {view === 'compare' && <>
-            <section className="section-heading results-heading"><div><span className="section-index">02 / COMPARE</span><h2>Policy comparison</h2></div><p>Same trace, deferral window, and GPU capacity for every policy.</p></section>
-            {comparisonFiles && <SavedFiles files={comparisonFiles} />}
-            {comparison ? <div className="panel compare-panel"><div className="panel-header"><div><span className="section-index">AVERAGE EMISSIONS</span><h3>Side-by-side policies</h3></div><span className="panel-badge">Lower is better</span></div><div className="compare-bars">{comparison.map((row) => <div className="compare-item" key={row.policy}><div className="compare-label"><strong>{POLICY_NAME[row.policy]}</strong><span>{number(row.emissions_avg_kg)} kg CO₂</span></div><div className="bar-track"><div className={`bar-fill ${row.policy === 'run_now' ? 'gray' : row.policy === 'oracle' ? 'blue' : 'green'}`} style={{ width: `${Math.max(0, ((row.emissions_avg_kg || 0) / comparisonMax) * 100)}%` }} /></div><div className="compare-detail"><span>{number(row.percent_saved_vs_run_now_avg_pct)}% saved</span><span>{number(row.deadline_misses, 0)} deadline misses</span><span>{number(row.mean_added_delay_hours)} h mean delay</span></div></div>)}</div><p className="chart-caption">Savings show as unavailable when a run leaves jobs unfinished. Oracle uses actual future CI as a forecast benchmark.</p></div> : <div className="empty-panel"><div className="empty-symbol">▥</div><h3>No comparison yet</h3><p>Select your inputs, then choose “Compare all policies” above.</p></div>}
+            <section className="section-heading results-heading"><div><span className="section-index">02 / COMPARE</span><h2>Policy comparison</h2></div><p>Same zone, deferral window, and GPU capacity for every policy.</p></section>
+            {comparison.length ? <div className="panel compare-panel"><div className="panel-header"><div><span className="section-index">AVERAGE EMISSIONS</span><h3>Side-by-side policies</h3></div><span className="panel-badge">Lower is better</span></div><div className="compare-bars">{comparison.map((row) => <div className="compare-item" key={row.policy}><div className="compare-label"><strong>{POLICY_NAME[row.policy]}</strong><span>{number(row.emissions_avg_kg)} kg CO₂</span></div><div className="bar-track"><div className={`bar-fill ${row.policy === 'run_now' ? 'gray' : row.policy === 'oracle' ? 'blue' : 'green'}`} style={{ width: `${Math.max(0, ((row.emissions_avg_kg || 0) / comparisonMax) * 100)}%` }} /></div><div className="compare-detail"><span>{number(row.percent_saved_vs_run_now_avg_pct)}% saved</span><span>{number(row.deadline_misses, 0)} deadline misses</span><span>{number(row.mean_added_delay_hours)} h mean delay</span></div></div>)}</div><p className="chart-caption">Savings show as unavailable when a run leaves jobs unfinished. Oracle uses actual future CI as a forecast benchmark.</p></div> : <div className="empty-panel"><div className="empty-symbol">▥</div><h3>No comparison available</h3><p>No runs in summary.csv match this zone, k and capacity.</p></div>}
           </>}
 
-          <footer className="page-footer"><span>Carbon Scheduler Studio</span><span>Simulation results are calculated by the Python scheduler and simulator.</span></footer>
+          <footer className="page-footer"><span>Carbon Scheduler Studio</span><span>Results are read from the saved sweep in results/; nothing is re-simulated here.</span></footer>
         </div>
       </main>
     </div>
